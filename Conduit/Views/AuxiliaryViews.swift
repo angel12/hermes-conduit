@@ -1206,7 +1206,7 @@ private struct AppearanceSettingsDetail: View {
 
 private struct NotificationsSettingsDetail: View {
     @ObservedObject private var notifications = PushNotificationService.shared
-    @AppStorage("conduit.relayURL") private var customRelayURL: String = 
+    @AppStorage("conduit.relayURL") private var customRelayURL: String = ""
 
     var body: some View {
         SettingsDetailContainer {
