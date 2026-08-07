@@ -1,0 +1,1936 @@
+//
+//  HermesClient.swift
+//  Conduit
+//
+//  JSON-RPC over WebSocket client for the Hermes gateway.
+//
+//  ARCHITECTURE NOTE:
+//  This client is deliberately thin — it only handles WebSocket transport
+//  and JSON-RPC request/response correlation. ALL session state, busy state,
+//  and reconnection logic lives in AppState.swift's syncSession().
+//
+//  The client reports stream events via onEvent callback and disconnects
+//  via onDisconnected callback. AppState decides what to do with them.
+//
+//  LESSONS FROM RN BUILDS 17-30:
+//  - `session.resume.running` and `session.info.running` are authoritative
+//    turn state. Missing `running` means the gateway is too old for safe chat
+//    controls.
+//  - Use resumed.messages from session.resume RPC, including any in-flight
+//    transcript state, rather than deriving liveness from message roles.
+//  - Do NOT merge gateway RPC session.list into the UI list — it reads from
+//    the main DB containing ALL profiles. Use profile-scoped endpoint only.
+//
+
+import Foundation
+import Combine
+import os
+
+// MARK: - JSON-RPC Types
+
+private struct JsonRpcRequest: Encodable {
+    let jsonrpc = "2.0"
+    let id: Int
+    let method: String
+    let params: [String: AnyCodable]?
+}
+
+private struct JsonRpcResponse: Decodable {
+    let id: Int?
+    let result: AnyCodable?
+    let error: RpcError?
+    let method: String?
+    let params: AnyCodable?
+}
+
+struct RpcError: Decodable, Error, LocalizedError {
+    let code: Int?
+    let message: String
+
+    var errorDescription: String? { message }
+}
+
+// Type-erased Codable for dynamic JSON
+enum AnyCodable: Codable, Equatable {
+    case null
+    case bool(Bool)
+    case number(Double)
+    case string(String)
+    case array([AnyCodable])
+    case object([String: AnyCodable])
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let v = try? container.decode(Bool.self) {
+            self = .bool(v)
+        } else if let v = try? container.decode(Double.self) {
+            self = .number(v)
+        } else if let v = try? container.decode(String.self) {
+            self = .string(v)
+        } else if let v = try? container.decode([AnyCodable].self) {
+            self = .array(v)
+        } else if let v = try? container.decode([String: AnyCodable].self) {
+            self = .object(v)
+        } else {
+            self = .null
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .null:
+            try container.encodeNil()
+        case .bool(let v):
+            try container.encode(v)
+        case .number(let v):
+            try container.encode(v)
+        case .string(let v):
+            try container.encode(v)
+        case .array(let v):
+            try container.encode(v)
+        case .object(let v):
+            try container.encode(v)
+        }
+    }
+
+    var stringValue: String? {
+        if case .string(let s) = self { return s }
+        return nil
+    }
+
+    /// Renders any AnyCodable type as a display string, not just raw strings.
+    /// Tool input/output from the gateway often arrives as JSON objects/arrays.
+    var descriptiveStringValue: String? {
+        switch self {
+        case .string(let s): return s
+        case .null: return nil
+        case .bool(let b): return String(b)
+        case .number(let n): return String(n)
+        case .array, .object:
+            // Serialize complex types to pretty JSON
+            if let data = try? JSONEncoder().encode(self),
+               let json = String(data: data, encoding: .utf8) {
+                return json
+            }
+            return nil
+        }
+    }
+
+    var intValue: Int? {
+        if case .number(let n) = self { return Int(n) }
+        return nil
+    }
+
+    var doubleValue: Double? {
+        if case .number(let n) = self { return n }
+        return nil
+    }
+
+    var boolValue: Bool? {
+        if case .bool(let b) = self { return b }
+        return nil
+    }
+
+    var arrayValue: [AnyCodable]? {
+        if case .array(let a) = self { return a }
+        return nil
+    }
+
+    var objectValue: [String: AnyCodable]? {
+        if case .object(let o) = self { return o }
+        return nil
+    }
+
+    // Deep conversion to native Swift types
+    var anyValue: Any {
+        switch self {
+        case .null: return NSNull()
+        case .bool(let v): return v
+        case .number(let v): return v
+        case .string(let v): return v
+        case .array(let v): return v.map { $0.anyValue }
+        case .object(let v): return v.mapValues { $0.anyValue }
+        }
+    }
+}
+
+// MARK: - Stream Events
+
+enum StreamEvent {
+    case messageStart(sessionId: String)
+    case messageDelta(sessionId: String, text: String)
+    case reasoningDelta(sessionId: String, text: String)
+    case messageComplete(sessionId: String, messageId: String?, content: String?, reasoning: String?)
+    case messageError(sessionId: String, message: String)
+    case messageInterrupted(sessionId: String)
+    case sessionBusy(sessionId: String, busy: Bool)
+    case sessionInfo(sessionId: String, snapshot: SessionRuntimeSnapshot)
+    case sessionTitle(runtimeSessionId: String, storedSessionId: String, title: String)
+    case toolStart(sessionId: String, toolName: String, toolInput: String?)
+    case toolComplete(sessionId: String, toolName: String, toolOutput: String?)
+    case reviewSummary(sessionId: String, activity: ReviewActivity)
+    case clarify(sessionId: String, requestId: String, question: String, choices: [(label: String, value: String)])
+    case approval(sessionId: String, activity: ApprovalActivity)
+    case contextUpdate(sessionId: String, percent: Double, used: Int, max: Int)
+    case cwdUpdate(sessionId: String, cwd: String)
+    case modelUpdate(sessionId: String, model: String, provider: String)
+    case agentCount(sessionId: String, count: Int)
+    case delegateAgent(sessionId: String, activity: DelegateAgentActivity)
+    case unparsed(payload: [String: Any])
+}
+
+/// Runtime fields returned by `session.resume` and `session.info`.
+/// `running` is optional only so the client can identify an outdated gateway
+/// and refuse to offer unreliable stop/steer controls.
+struct SessionRuntimeSnapshot {
+    let running: Bool?
+    let status: String?
+    let model: String?
+    let provider: String?
+    let cwd: String?
+    let contextPercent: Double?
+    let contextUsed: Int?
+    let contextMax: Int?
+    let activeAgents: Int?
+    let reasoningEffort: String?
+    let fast: Bool?
+    /// Per-session approval bypass. This overrides the profile default while
+    /// the conversation is active without changing `approvals.mode` itself.
+    let yolo: Bool?
+    let approvalsMode: String?
+    let inflight: AnyCodable?
+    let queued: AnyCodable?
+
+    /// `session.resume` may include an in-flight or queued projection that is
+    /// newer than the persisted database transcript. Keep that projection for
+    /// a live turn; the REST transcript is otherwise the richer history view.
+    var hasLiveProjection: Bool {
+        [inflight, queued].contains { value in
+            guard let value else { return false }
+            // Mirror JavaScript's `Boolean(resumed.inflight || resumed.queued)`
+            // check in Desktop. In particular, `queued: false` must not hide
+            // the durable timestamped transcript.
+            switch value {
+            case .null:
+                return false
+            case .bool(let flag):
+                return flag
+            case .number(let number):
+                return number != 0 && !number.isNaN
+            case .string(let text):
+                return !text.isEmpty
+            case .array, .object:
+                return true
+            }
+        }
+    }
+
+    /// The in-flight projection holds text that has not reached state.db yet.
+    /// A resumed live turn needs this prefix before it accepts new token deltas.
+    var inflightAssistantText: String {
+        guard let object = inflight?.objectValue else { return "" }
+        return ["assistant", "text", "content"]
+            .compactMap { object[$0]?.stringValue }
+            .first { !$0.isEmpty } ?? ""
+    }
+
+    init(
+        object: [String: AnyCodable],
+        inflight: AnyCodable? = nil,
+        queued: AnyCodable? = nil
+    ) {
+        running = object["running"]?.boolValue
+        status = object["status"]?.stringValue
+        model = object["model"]?.stringValue
+        provider = object["provider"]?.stringValue
+        cwd = object["cwd"]?.stringValue
+        contextPercent = object["context_percent"]?.doubleValue
+        contextUsed = object["context_used"]?.intValue
+        contextMax = object["context_max"]?.intValue
+        activeAgents = object["active_agents"]?.intValue ?? object["active_subagents"]?.intValue
+        reasoningEffort = object["reasoning_effort"]?.stringValue
+            ?? object["reasoning"]?.stringValue
+        fast = object["fast"]?.boolValue
+            ?? object["fast_mode"]?.boolValue
+        yolo = object["yolo"]?.boolValue
+        approvalsMode = object["approvals_mode"]?.stringValue
+            ?? object["approval_mode"]?.stringValue
+            ?? object["approvals"]?.objectValue?["mode"]?.stringValue
+        self.inflight = inflight
+        self.queued = queued
+    }
+}
+
+struct SessionResumeResult {
+    let sessionId: String
+    let messages: [ChatMessage]
+    let snapshot: SessionRuntimeSnapshot
+}
+
+struct SessionBranchMessage {
+    let role: MessageRole
+    let content: String
+}
+
+/// Result of the newer active-turn correction RPC. `queued` is still a
+/// successful delivery: Hermes accepted the correction while the agent was
+/// in its short turn-build window and will run it next.
+enum SessionRedirectOutcome: Equatable {
+    case redirected
+    case queued
+    case rejected
+
+    init(gatewayStatus: String?) {
+        switch gatewayStatus?.lowercased() {
+        case "redirected": self = .redirected
+        case "queued": self = .queued
+        default: self = .rejected
+        }
+    }
+}
+
+// MARK: - Pending Request
+
+private struct PendingRequest {
+    let continuation: CheckedContinuation<AnyCodable, Error>
+    let timer: Timer?
+}
+
+/// URLSession only confirms the WebSocket handshake through its delegate. The
+/// client must not issue session RPCs or paint a green indicator before this
+/// callback, otherwise a just-opened socket can race its first `session.resume`.
+private final class WebSocketOpenDelegate: NSObject, URLSessionWebSocketDelegate {
+    var onOpen: ((URLSessionWebSocketTask) -> Void)?
+    var onCloseBeforeOpen: ((URLSessionWebSocketTask) -> Void)?
+
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
+        onOpen?(webSocketTask)
+    }
+
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        onCloseBeforeOpen?(webSocketTask)
+    }
+}
+
+// MARK: - HermesClient
+
+@MainActor
+final class HermesClient: ObservableObject {
+
+    private let logger = Logger(subsystem: "com.milim.conduit", category: "HermesClient")
+
+    // Published state for SwiftUI views
+    @Published private(set) var isConnected = false
+
+    // Non-published internal state
+    private var socket: URLSessionWebSocketTask?
+    private var session: URLSession?
+    private var socketDelegate: WebSocketOpenDelegate?
+    private var requestId = 0
+    private var pending = [Int: PendingRequest]()
+    private var closedIntentionally = false
+    private var receiveTask: Task<Void, Never>?
+    private var socketHasOpened = false
+    private var openContinuation: CheckedContinuation<Void, Error>?
+    private var openTimeoutTask: Task<Void, Never>?
+
+    let connection: HermesConnection
+    let profile: String?
+
+    // Callback for stream events (set by AppState)
+    var onEvent: ((StreamEvent) -> Void)?
+    var onDisconnected: (() -> Void)?
+
+    static let requestTimeout: TimeInterval = 30
+    static let promptSubmitTimeout: TimeInterval = 180 // 3 minutes
+    static let titleGenerationTimeout: TimeInterval = 90
+
+    init(connection: HermesConnection, profile: String? = nil) {
+        self.connection = connection
+        self.profile = profile
+    }
+
+    // MARK: - Connection
+
+    func connect() async throws {
+        closedIntentionally = false
+        socketHasOpened = false
+        let url: URL
+        do {
+            url = try ConnectionURLPolicy.webSocketURL(
+                baseURL: connection.baseUrl,
+                path: "/api/ws",
+                queryItems: [URLQueryItem(name: "ticket", value: connection.ticket)]
+            )
+        } catch {
+            throw HermesError.invalidUrl
+        }
+
+        let config = URLSessionConfiguration.default
+        config.waitsForConnectivity = true
+        let socketDelegate = WebSocketOpenDelegate()
+        socketDelegate.onOpen = { [weak self] task in
+            Task { @MainActor in self?.didOpen(task) }
+        }
+        socketDelegate.onCloseBeforeOpen = { [weak self] task in
+            Task { @MainActor in self?.didClose(task) }
+        }
+        let session = URLSession(configuration: config, delegate: socketDelegate, delegateQueue: nil)
+        self.session = session
+        self.socketDelegate = socketDelegate
+
+        let socket = session.webSocketTask(with: url)
+        self.socket = socket
+        socket.resume()
+        try await waitForSocketOpen(socket)
+        isConnected = true
+        logger.notice("WebSocket handshake completed")
+
+        // Start listening for messages
+        receiveTask = Task { [weak self] in
+            await self?.receiveLoop()
+        }
+    }
+
+    private func waitForSocketOpen(_ socket: URLSessionWebSocketTask) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            openContinuation = continuation
+            openTimeoutTask?.cancel()
+            openTimeoutTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled else { return }
+                await self?.failSocketOpen(socket, error: HermesError.timeout("WebSocket connection"))
+            }
+        }
+    }
+
+    private func didOpen(_ socket: URLSessionWebSocketTask) {
+        guard self.socket === socket, !socketHasOpened else { return }
+        socketHasOpened = true
+        openTimeoutTask?.cancel()
+        openTimeoutTask = nil
+        openContinuation?.resume()
+        openContinuation = nil
+    }
+
+    private func didClose(_ socket: URLSessionWebSocketTask) {
+        guard self.socket === socket, !socketHasOpened else { return }
+        failSocketOpen(socket, error: HermesError.connectionClosed)
+    }
+
+    private func failSocketOpen(_ socket: URLSessionWebSocketTask, error: Error) {
+        guard self.socket === socket else { return }
+        openTimeoutTask?.cancel()
+        openTimeoutTask = nil
+        socket.cancel(with: .goingAway, reason: nil)
+        self.socket = nil
+        openContinuation?.resume(throwing: error)
+        openContinuation = nil
+    }
+
+    private func receiveLoop() async {
+        guard let socket = socket else { return }
+
+        while !Task.isCancelled {
+            do {
+                let message = try await socket.receive()
+                switch message {
+                case .data(let data):
+                    handleMessage(data: data)
+                case .string(let text):
+                    handleMessage(data: Data(text.utf8))
+                @unknown default:
+                    break
+                }
+            } catch {
+                // Socket closed or errored
+                logger.error("WebSocket receive failed: \(error.localizedDescription, privacy: .public)")
+                isConnected = false
+                if !closedIntentionally {
+                    onDisconnected?()
+                }
+                break
+            }
+        }
+    }
+
+    private func handleMessage(data: Data) {
+        guard let json = try? JSONDecoder().decode(JsonRpcResponse.self, from: data) else {
+            logger.error("Dropped undecodable inbound WebSocket frame (\(data.count) bytes)")
+            return
+        }
+
+        // Handle RPC response (has id)
+        if let id = json.id {
+            guard let pending = pending.removeValue(forKey: id) else {
+                logger.debug("Received unmatched RPC response id \(id)")
+                return
+            }
+            logger.notice("Received RPC response id \(id)")
+            pending.timer?.invalidate()
+            if let error = json.error {
+                pending.continuation.resume(throwing: error)
+            } else {
+                pending.continuation.resume(returning: json.result ?? .null)
+            }
+            return
+        }
+
+        // Handle stream event notification
+        if json.method == "event", let params = json.params {
+            handleStreamEvent(params: params)
+        } else {
+            logger.debug("Received non-event WebSocket notification without an RPC id")
+        }
+    }
+
+    private func handleStreamEvent(params: AnyCodable) {
+        guard let obj = params.objectValue else { return }
+        let type = obj["type"]?.stringValue ?? ""
+        let sessionId = obj["session_id"]?.stringValue ?? ""
+        let payload = obj["payload"]?.objectValue
+
+        switch type {
+        case "message.start":
+            onEvent?(.messageStart(sessionId: sessionId))
+
+        case "message.delta":
+            let text = payload?["text"]?.stringValue ?? obj["text"]?.stringValue ?? ""
+            if !text.isEmpty {
+                onEvent?(.messageDelta(sessionId: sessionId, text: text))
+            }
+
+        case "reasoning.delta", "message.reasoning", "message.reasoning.delta":
+            let text = payload?["reasoning"]?.stringValue
+                ?? payload?["reasoning_content"]?.stringValue
+                ?? payload?["text"]?.stringValue
+                ?? payload?["content"]?.stringValue
+                ?? obj["reasoning"]?.stringValue
+                ?? obj["text"]?.stringValue
+                ?? ""
+            if !text.isEmpty {
+                onEvent?(.reasoningDelta(sessionId: sessionId, text: text))
+            }
+
+        case "message.complete":
+            let messageId = payload?["message_id"]?.stringValue
+                ?? payload?["id"]?.stringValue
+                ?? payload?["message"]?.objectValue?["id"]?.stringValue
+                ?? obj["message_id"]?.stringValue
+                ?? obj["id"]?.stringValue
+            let content = payload?["content"]?.stringValue
+                ?? payload?["text"]?.stringValue
+                ?? payload?["rendered"]?.stringValue
+            let reasoning = payload?["reasoning"]?.stringValue
+            onEvent?(.messageComplete(sessionId: sessionId, messageId: messageId, content: content, reasoning: reasoning))
+
+        case "error":
+            onEvent?(.messageError(sessionId: sessionId, message: payload?["message"]?.stringValue ?? "Hermes reported an error."))
+
+        case "message.interrupted", "session.interrupted":
+            onEvent?(.messageInterrupted(sessionId: sessionId))
+
+        case "session.busy":
+            let busy = payload?["busy"]?.boolValue ?? false
+            onEvent?(.sessionBusy(sessionId: sessionId, busy: busy))
+
+        case "session.info":
+            onEvent?(.sessionInfo(sessionId: sessionId, snapshot: SessionRuntimeSnapshot(object: payload ?? [:])))
+
+        case "session.title":
+            let storedSessionId = payload?["session_id"]?.stringValue ?? ""
+            let title = payload?["title"]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !storedSessionId.isEmpty, !title.isEmpty {
+                onEvent?(.sessionTitle(
+                    runtimeSessionId: sessionId,
+                    storedSessionId: storedSessionId,
+                    title: title
+                ))
+            }
+
+        case "tool.start", "tool_call":
+            let name = payload?["name"]?.stringValue ?? ""
+            let input = payload?["args_text"]?.descriptiveStringValue
+                ?? payload?["context"]?.descriptiveStringValue
+                ?? payload?["input"]?.descriptiveStringValue
+                ?? payload?["arguments"]?.descriptiveStringValue
+            ?? payload?["args"]?.descriptiveStringValue
+            onEvent?(.toolStart(sessionId: sessionId, toolName: name, toolInput: input))
+
+        case "tool.complete", "tool_result":
+            let name = payload?["name"]?.stringValue ?? ""
+            let output = payload?["output"]?.descriptiveStringValue ?? payload?["result"]?.descriptiveStringValue
+            onEvent?(.toolComplete(sessionId: sessionId, toolName: name, toolOutput: output))
+
+        case "review.summary":
+            guard let payload, let review = MessageNormalizer.reviewActivity(from: payload, eventSessionId: sessionId) else { return }
+            onEvent?(.reviewSummary(sessionId: sessionId, activity: review))
+
+        case "clarify", "clarify.request":
+            guard let payload,
+                  let clarify = MessageNormalizer.clarifyActivity(from: payload) else { return }
+            onEvent?(.clarify(
+                sessionId: sessionId,
+                requestId: clarify.requestId,
+                question: clarify.question,
+                choices: clarify.choices.map { (label: $0.label, value: $0.value) }
+            ))
+
+        case "approval.request":
+            guard let payload,
+                  let approval = MessageNormalizer.approvalActivity(from: payload, sessionId: sessionId) else { return }
+            onEvent?(.approval(sessionId: sessionId, activity: approval))
+
+        case "context.update", "session.context":
+            let percent = payload?["context_percent"]?.doubleValue ?? 0
+            let used = payload?["context_used"]?.intValue ?? 0
+            let max = payload?["context_max"]?.intValue ?? 0
+            onEvent?(.contextUpdate(sessionId: sessionId, percent: percent, used: used, max: max))
+
+        case "cwd.update", "workspace.update":
+            let cwd = payload?["cwd"]?.stringValue ?? ""
+            onEvent?(.cwdUpdate(sessionId: sessionId, cwd: cwd))
+
+        case "model.update":
+            let model = payload?["model"]?.stringValue ?? ""
+            let provider = payload?["provider"]?.stringValue ?? ""
+            onEvent?(.modelUpdate(sessionId: sessionId, model: model, provider: provider))
+
+        case let eventType where eventType.hasPrefix("subagent."):
+            guard let payload else { return }
+            let activity = delegateAgentActivity(from: payload, eventType: eventType)
+            onEvent?(.delegateAgent(sessionId: sessionId, activity: activity))
+
+        default:
+            // Pass through unparsed events
+            onEvent?(.unparsed(payload: obj.mapValues { $0.anyValue }))
+        }
+    }
+
+    func disconnect() {
+        closedIntentionally = true
+        receiveTask?.cancel()
+        openTimeoutTask?.cancel()
+        openTimeoutTask = nil
+        openContinuation?.resume(throwing: HermesError.connectionClosed)
+        openContinuation = nil
+        socket?.cancel(with: .goingAway, reason: nil)
+        socket = nil
+        session?.invalidateAndCancel()
+        socketDelegate = nil
+        isConnected = false
+        // Fail all pending requests
+        for (_, pending) in pending {
+            pending.timer?.invalidate()
+            pending.continuation.resume(throwing: HermesError.connectionClosed)
+        }
+        pending.removeAll()
+    }
+
+    // MARK: - RPC
+
+    private func rpc(_ method: String, params: [String: Any]? = nil, timeout: TimeInterval = requestTimeout) async throws -> AnyCodable {
+        guard let socket, socket.closeCode == .invalid else {
+            throw HermesError.notConnected
+        }
+
+        let id = incrementRequestId()
+        let scopedParams = scopeParams(params)
+        let encodedParams = scopedParams?.mapValues { AnyCodable.from($0) }
+
+        let request = JsonRpcRequest(id: id, method: method, params: encodedParams)
+        let body = try JSONEncoder().encode(request)
+        logger.notice("Sending RPC id \(id) method \(method, privacy: .public)")
+
+        return try await withCheckedThrowingContinuation { continuation in
+            // Timeout
+            let timer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
+                Task { @MainActor in
+                    if let pending = self?.pending.removeValue(forKey: id) {
+                        pending.continuation.resume(throwing: HermesError.timeout(method))
+                    }
+                }
+            }
+
+            pending[id] = PendingRequest(continuation: continuation, timer: timer)
+
+            // Hermes' established React Native client uses WebSocket text
+            // frames (`socket.send(JSON.stringify(...))`). The gateway accepts
+            // the connection but does not dispatch binary JSON-RPC frames.
+            let text = String(decoding: body, as: UTF8.self)
+            socket.send(.string(text)) { [weak self] error in
+                if let error {
+                    self?.logger.error("RPC send failed for \(method, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                    Task { @MainActor in
+                        if let pending = self?.pending.removeValue(forKey: id) {
+                            pending.timer?.invalidate()
+                            pending.continuation.resume(throwing: error)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func incrementRequestId() -> Int {
+        requestId += 1
+        return requestId
+    }
+
+    private func scopeParams(_ params: [String: Any]?) -> [String: Any]? {
+        var params = params ?? [:]
+        if let profile, profile != "default" {
+            params["profile"] = profile
+        }
+        return params.isEmpty ? nil : params
+    }
+
+    // MARK: - API Methods
+
+    /// Matches the React Native transport: the default profile uses no
+    /// parameters, while every other profile carries its gateway context even
+    /// though `session.list` itself has no explicit arguments.
+    func sessions() async throws -> [SessionSummary] {
+        let result = try await rpc("session.list", params: nil)
+        return MessageNormalizer.normalizeSessions(result, profile: profile)
+    }
+
+    /// Projects are a newer, optional gateway capability. Unlike the ordinary
+    /// session catalog, membership comes from Hermes' server-side project tree
+    /// so every Hermes client sees the same organization.
+    func projects() async throws -> [ProjectSummary] {
+        let result = try await rpc("projects.tree", params: ["preview_limit": 3])
+        return MessageNormalizer.normalizeProjects(result, profile: profile)
+    }
+
+    func projectSessions(_ projectId: String) async throws -> ProjectSessionDetail? {
+        let result = try await rpc("projects.project_sessions", params: ["project_id": projectId])
+        return MessageNormalizer.normalizeProjectSessions(result, profile: profile)
+    }
+
+    func createProject(name: String, folders: [String]) async throws -> ProjectSummary? {
+        let result = try await rpc("projects.create", params: [
+            "name": name,
+            "folders": folders,
+            "primary_path": folders.first ?? "",
+            "use": true
+        ])
+        guard let project = result.objectValue?["project"] else { return nil }
+        return MessageNormalizer.normalizeProject(project, profile: profile)
+    }
+
+    func healthCheck() async throws {
+        _ = try await rpc("session.list", params: nil, timeout: 8)
+    }
+
+    func openSession(_ sessionId: String) async throws -> SessionResumeResult {
+        let result = try await rpc("session.resume", params: [
+            "session_id": sessionId,
+            "cols": 96,
+            "source": "desktop"
+        ])
+        let object = result.objectValue ?? [:]
+        let resolvedId = object["session_id"]?.stringValue ?? sessionId
+        let messages = MessageNormalizer.normalizeMessages(
+            object["messages"]?.arrayValue ?? []
+        )
+        var snapshotObject = object["info"]?.objectValue ?? [:]
+        // The resume response owns the liveness fields. Keep `info` for the
+        // rest of the runtime metadata, but let top-level values win.
+        for key in ["running", "status"] {
+            if let value = object[key] {
+                snapshotObject[key] = value
+            }
+        }
+        return SessionResumeResult(
+            sessionId: resolvedId,
+            messages: messages,
+            snapshot: SessionRuntimeSnapshot(
+                object: snapshotObject,
+                inflight: object["inflight"],
+                queued: object["queued"]
+            )
+        )
+    }
+
+    func busyInputMode() async throws -> BusyInputMode {
+        let result = try await rpc("config.set", params: ["key": "busy", "value": "status"])
+        let value = result.objectValue?["value"]?.stringValue?.lowercased()
+        return BusyInputMode.fromGatewayValue(value)
+    }
+
+    func setBusyInputMode(_ mode: BusyInputMode) async throws {
+        _ = try await rpc("config.set", params: ["key": "busy", "value": mode.rawValue])
+    }
+
+    func createSession(model: String? = nil, provider: String? = nil, reasoningEffort: String? = nil, fast: Bool? = nil, cwd: String? = nil) async throws -> (sessionId: String, storedSessionId: String?, profile: String?) {
+        var params: [String: Any] = [
+            "cols": 96,
+            "source": "desktop"
+        ]
+        // Keep this explicit instead of relying solely on the generic RPC
+        // scope. Hermes Desktop does the same: a global gateway can otherwise
+        // create an unscoped session in its launch/default profile.
+        if let profile, !profile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            params["profile"] = profile
+        }
+        if let model {
+            params["model"] = model
+            if let provider { params["provider"] = provider }
+        }
+        if let reasoningEffort { params["reasoning_effort"] = reasoningEffort }
+        if let fast, fast { params["fast"] = true }
+        if let cwd, !cwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { params["cwd"] = cwd }
+        let result = try await rpc("session.create", params: params)
+        let object = result.objectValue ?? [:]
+        let sid = object["session_id"]?.stringValue ?? ""
+        let stored = object["stored_session_id"]?.stringValue
+        let profile = object["profile"]?.stringValue ?? object["profile_id"]?.stringValue
+        return (sid, stored, profile)
+    }
+
+    /// Creates a historical fork rather than a blank conversation. Hermes
+    /// preserves the supplied prefix, then lets the new session continue from
+    /// the selected assistant response.
+    func branchSession(
+        parentSessionId: String,
+        messages: [SessionBranchMessage],
+        title: String,
+        cwd: String?
+    ) async throws -> (sessionId: String, storedSessionId: String?, profile: String?) {
+        var params: [String: Any] = [
+            "cols": 96,
+            "source": "desktop",
+            "parent_session_id": parentSessionId,
+            "title": title,
+            "messages": messages.map { ["role": $0.role.rawValue, "content": $0.content] }
+        ]
+        if let profile, !profile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            params["profile"] = profile
+        }
+        if let cwd, !cwd.isEmpty { params["cwd"] = cwd }
+        let result = try await rpc("session.create", params: params)
+        let object = result.objectValue ?? [:]
+        let sessionId = object["session_id"]?.stringValue ?? ""
+        guard !sessionId.isEmpty else { throw HermesError.invalidResponse }
+        return (
+            sessionId,
+            object["stored_session_id"]?.stringValue,
+            object["profile"]?.stringValue ?? object["profile_id"]?.stringValue
+        )
+    }
+
+    func setSessionTitle(_ sessionId: String, title: String) async throws {
+        _ = try await rpc("session.title", params: [
+            "session_id": sessionId,
+            "title": title
+        ])
+    }
+
+    /// Reads the gateway's current title without guessing from the local
+    /// catalog. This is particularly important for profile-scoped sessions,
+    /// whose title can be updated asynchronously by Hermes.
+    func sessionTitle(_ sessionId: String) async throws -> String? {
+        let result = try await rpc("session.title", params: ["session_id": sessionId])
+        let title = result.objectValue?["title"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (title?.isEmpty == false) ? title : nil
+    }
+
+    /// Hermes' one-shot endpoint uses the configured title-capable model but
+    /// does not add a message to the conversation history.
+    func generateSessionTitle(
+        _ sessionId: String,
+        userMessage: String,
+        assistantMessage: String,
+        language: String? = nil
+    ) async throws -> String? {
+        let requestedLanguage = language?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let languageInstruction = requestedLanguage.isEmpty
+            ? "Write the title in the same language the user is writing in."
+            : "Write the title in \(requestedLanguage)."
+        let userSnippet = String(userMessage.prefix(500))
+        let assistantSnippet = String(assistantMessage.prefix(500))
+        let result = try await rpc("llm.oneshot", params: [
+            "session_id": sessionId,
+            "task": "title_generation",
+            "instructions": "Generate a short, descriptive title (3-7 words) for a conversation that starts with the following exchange. The title should capture the main topic or intent. \(languageInstruction) Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes.",
+            "input": "User: \(userSnippet)\n\nAssistant: \(assistantSnippet)",
+            "max_tokens": 500,
+            "temperature": 0.3
+        ], timeout: Self.titleGenerationTimeout)
+        return result.objectValue?["text"]?.stringValue
+    }
+
+    func sendPrompt(_ sessionId: String, text: String) async throws {
+        _ = try await rpc("prompt.submit", params: [
+            "session_id": sessionId,
+            "text": text
+        ], timeout: Self.promptSubmitTimeout)
+    }
+
+    func steer(_ sessionId: String, text: String) async throws {
+        let result = try await rpc("session.steer", params: [
+            "session_id": sessionId,
+            "text": text
+        ])
+        if result.objectValue?["status"]?.stringValue == "rejected" {
+            throw HermesError.steerRejected
+        }
+    }
+
+    func redirect(_ sessionId: String, text: String) async throws -> SessionRedirectOutcome {
+        let result = try await rpc("session.redirect", params: [
+            "session_id": sessionId,
+            "text": text
+        ])
+        return SessionRedirectOutcome(gatewayStatus: result.objectValue?["status"]?.stringValue)
+    }
+
+    func cancel(_ sessionId: String) async throws {
+        _ = try await rpc("session.interrupt", params: [
+            "session_id": sessionId
+        ])
+    }
+
+    func respondToClarification(requestId: String, answer: String) async throws {
+        _ = try await rpc("clarify.respond", params: [
+            "request_id": requestId,
+            "answer": answer
+        ])
+    }
+
+    func respondToApproval(sessionId: String, choice: String) async throws {
+        _ = try await rpc("approval.respond", params: [
+            "choice": choice,
+            "session_id": sessionId
+        ])
+    }
+
+    func modelOptions(sessionId: String? = nil) async throws -> (model: String?, provider: String?, providers: [ProviderInfo]?) {
+        var params: [String: Any] = ["explicit_only": true]
+        if let sessionId { params["session_id"] = sessionId }
+        let result = try await rpc("model.options", params: params)
+        let obj = result.objectValue ?? [:]
+        let model = obj["model"]?.stringValue
+        let provider = obj["provider"]?.stringValue
+        let providers = (obj["providers"]?.arrayValue ?? []).compactMap { ProviderInfo(from: $0) }
+        return (model, provider, providers)
+    }
+
+    func setModel(_ sessionId: String, model: String, provider: String) async throws {
+        _ = try await rpc("config.set", params: [
+            "key": "model",
+            "session_id": sessionId,
+            "value": "\(model) --provider \(provider) --session"
+        ])
+    }
+
+    func setReasoning(_ sessionId: String, effort: String) async throws {
+        _ = try await rpc("config.set", params: [
+            "key": "reasoning",
+            "session_id": sessionId,
+            "value": effort
+        ])
+    }
+
+    func setFast(_ sessionId: String, enabled: Bool) async throws {
+        _ = try await rpc("config.set", params: [
+            "key": "fast",
+            "session_id": sessionId,
+            "value": enabled ? "fast" : "normal"
+        ])
+    }
+
+    /// Session-only approval bypass, matching Desktop and the TUI's Shift+Tab.
+    /// The persistent profile default is managed separately through Settings.
+    func setSessionYolo(_ sessionId: String, enabled: Bool) async throws {
+        _ = try await rpc("config.set", params: [
+            "key": "yolo",
+            "session_id": sessionId,
+            "value": enabled ? "1" : "0"
+        ])
+    }
+
+    func contextBreakdown(_ sessionId: String) async throws -> ContextBreakdown {
+        let result = try await rpc("session.context_breakdown", params: [
+            "session_id": sessionId
+        ])
+        return ContextBreakdown(from: result)
+    }
+
+    // MARK: - Slash Commands
+
+    func commandsCatalog(sessionId: String? = nil) async throws -> AnyCodable {
+        var params: [String: Any] = [:]
+        if let sessionId { params["session_id"] = sessionId }
+        return try await rpc("commands.catalog", params: params.isEmpty ? nil : params)
+    }
+
+    func executeSlash(sessionId: String, command: String) async throws -> AnyCodable {
+        // Strip leading slashes so callers can pass "/clear" or "clear"
+        let cleaned = command.replacingOccurrences(of: "^/+", with: "", options: .regularExpression)
+        return try await rpc("slash.exec", params: [
+            "session_id": sessionId,
+            "command": cleaned
+        ])
+    }
+
+    func dispatchCommand(sessionId: String, name: String, arg: String) async throws -> AnyCodable {
+        return try await rpc("command.dispatch", params: [
+            "session_id": sessionId,
+            "name": name,
+            "arg": arg
+        ])
+    }
+
+    // MARK: - Attachments
+
+    func attachImage(_ sessionId: String, base64: String, filename: String) async throws -> String? {
+        let result = try await rpc("image.attach_bytes", params: [
+            "session_id": sessionId,
+            "content_base64": base64,
+            "filename": filename
+        ])
+        return result.objectValue?["path"]?.stringValue
+    }
+
+    func attachPdf(_ sessionId: String, base64: String, filename: String) async throws {
+        _ = try await rpc("pdf.attach", params: [
+            "session_id": sessionId,
+            "content_base64": base64,
+            "filename": filename
+        ], timeout: 120)
+    }
+
+    func attachFile(_ sessionId: String, dataUrl: String, name: String, path: String = "") async throws {
+        _ = try await rpc("file.attach", params: [
+            "session_id": sessionId,
+            "data_url": dataUrl,
+            "name": name,
+            "path": path
+        ], timeout: 120)
+    }
+
+    // MARK: - Cron
+
+    func listCronJobs() async throws -> [CronJob] {
+        let result = try await rpc("cron.list")
+        let arr = result.objectValue?["jobs"]?.arrayValue ?? result.arrayValue ?? []
+        return arr.compactMap { try? JSONDecoder().decode(CronJob.self, from: JSONSerialization.data(withJSONObject: $0.anyValue)) }
+    }
+
+    func cronRuns() async throws -> [CronRun] {
+        let result = try await rpc("cron.runs")
+        let arr = result.objectValue?["runs"]?.arrayValue ?? result.arrayValue ?? []
+        return arr.compactMap { try? JSONDecoder().decode(CronRun.self, from: JSONSerialization.data(withJSONObject: $0.anyValue)) }
+    }
+
+    private func delegateAgentActivity(from payload: [String: AnyCodable], eventType: String) -> DelegateAgentActivity {
+        let id = payload["id"]?.stringValue ?? payload["agent_id"]?.stringValue ?? UUID().uuidString
+        let statusValue = payload["status"]?.stringValue ?? {
+            if eventType.contains("fail") { return "failed" }
+            if eventType.contains("interrupt") { return "interrupted" }
+            if eventType.contains("complete") || eventType.contains("finish") { return "completed" }
+            if eventType.contains("spawn") { return "queued" }
+            return "running"
+        }()
+        let status = DelegateAgentActivity.Status(rawValue: statusValue.lowercased()) ?? .running
+        let text = payload["text"]?.stringValue ?? payload["message"]?.stringValue ?? payload["summary"]?.stringValue ?? ""
+        let kind: DelegateAgentActivity.StreamLine.Kind = eventType.contains("tool") ? .tool : eventType.contains("thinking") ? .thinking : eventType.contains("progress") ? .progress : .summary
+        let lines = text.isEmpty ? [] : [DelegateAgentActivity.StreamLine(kind: kind, text: text, isError: status == .failed)]
+        return DelegateAgentActivity(
+            id: id,
+            goal: payload["goal"]?.stringValue ?? payload["task"]?.stringValue ?? "Delegate agent",
+            model: payload["model"]?.stringValue,
+            status: status,
+            taskCount: payload["task_count"]?.intValue ?? 1,
+            taskIndex: payload["task_index"]?.intValue ?? 0,
+            currentTool: payload["tool"]?.stringValue ?? payload["current_tool"]?.stringValue,
+            summary: payload["summary"]?.stringValue,
+            stream: lines
+        )
+    }
+}
+
+// MARK: - Supporting Types
+
+struct ProviderInfo: Equatable {
+    let name: String
+    let models: [ModelInfo]
+}
+
+struct ModelInfo: Equatable {
+    let id: String
+    let label: String?
+    let reasoningCapable: Bool
+}
+
+extension ProviderInfo {
+    init?(from codable: AnyCodable) {
+        let object = codable.objectValue ?? [:]
+        guard let name = object["slug"]?.stringValue ?? object["id"]?.stringValue ?? object["name"]?.stringValue,
+              !name.isEmpty else { return nil }
+        self.name = name
+        self.models = (object["models"]?.arrayValue ?? []).compactMap { model in
+            if let id = model.stringValue, !id.isEmpty {
+                return ModelInfo(id: id, label: nil, reasoningCapable: false)
+            }
+            let item = model.objectValue ?? [:]
+            guard let id = item["id"]?.stringValue ?? item["model"]?.stringValue ?? item["name"]?.stringValue,
+                  !id.isEmpty else { return nil }
+            return ModelInfo(
+                id: id,
+                label: item["label"]?.stringValue,
+                reasoningCapable: item["reasoning"]?.boolValue ?? false
+            )
+        }
+    }
+
+}
+
+struct ContextBreakdown {
+    var categories: [(id: String, label: String, tokens: Int, color: String)]
+    var contextMax: Int
+    var contextPercent: Double
+    var contextUsed: Int
+    var estimatedTotal: Int
+    var model: String?
+
+    init(from codable: AnyCodable) {
+        let obj = codable.objectValue ?? [:]
+        self.categories = (obj["categories"]?.arrayValue ?? []).compactMap { cat in
+            guard let id = cat.objectValue?["id"]?.stringValue,
+                  let label = cat.objectValue?["label"]?.stringValue else { return nil }
+            return (
+                id: id,
+                label: label,
+                tokens: cat.objectValue?["tokens"]?.intValue ?? 0,
+                color: cat.objectValue?["color"]?.stringValue ?? "amber"
+            )
+        }
+        self.contextMax = obj["context_max"]?.intValue ?? 0
+        self.contextPercent = obj["context_percent"]?.doubleValue ?? 0
+        self.contextUsed = obj["context_used"]?.intValue ?? 0
+        self.estimatedTotal = obj["estimated_total"]?.intValue ?? 0
+        self.model = obj["model"]?.stringValue
+    }
+
+    /// Hermes versions have reported `context_percent` both as a 0...1
+    /// fraction and a 0...100 percentage. Prefer the actual token totals when
+    /// available so the composer ring has one stable representation.
+    var resolvedUsed: Int {
+        if contextUsed > 0 { return contextUsed }
+        if estimatedTotal > 0 { return estimatedTotal }
+        return categories.reduce(0) { $0 + $1.tokens }
+    }
+
+    var resolvedPercent: Double {
+        // Match the desktop client's live gauge. Token arithmetic is useful
+        // only for older gateways that omit the explicit usage value; several
+        // context engines count categories differently from the active window.
+        if contextPercent > 0 { return normalizedPercent(contextPercent) }
+        if contextMax > 0, resolvedUsed > 0 {
+            return min(max((Double(resolvedUsed) / Double(contextMax)) * 100, 0), 100)
+        }
+        return 0
+    }
+}
+
+private func normalizedPercent(_ value: Double) -> Double {
+    let percent = (0...1).contains(value) ? value * 100 : value
+    return min(max(percent, 0), 100)
+}
+
+// Alias for backward compatibility
+extension ContextBreakdown {
+    var contextCount: Int {
+        get { contextUsed }
+        set { contextUsed = newValue }
+    }
+}
+
+enum HermesError: Error, LocalizedError {
+    case invalidUrl
+    case invalidResponse
+    case notConnected
+    case connectionClosed
+    case timeout(String)
+    case steerRejected
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidUrl: return "Invalid gateway URL."
+        case .invalidResponse: return "Hermes returned an incomplete response."
+        case .notConnected: return "Hermes is not connected."
+        case .connectionClosed: return "Hermes connection closed."
+        case .timeout(let method): return "Request timed out: \(method)"
+        case .steerRejected: return "Hermes could not steer the active response."
+        }
+    }
+}
+
+// MARK: - AnyCodable.from helper
+
+extension AnyCodable {
+    static func from(_ value: Any) -> AnyCodable {
+        if value is NSNull { return .null }
+        if let v = value as? Bool { return .bool(v) }
+        if let v = value as? Int { return .number(Double(v)) }
+        if let v = value as? Double { return .number(v) }
+        if let v = value as? String { return .string(v) }
+        if let v = value as? [Any] { return .array(v.map { AnyCodable.from($0) }) }
+        if let v = value as? [String: Any] { return .object(v.mapValues { AnyCodable.from($0) }) }
+        return .null
+    }
+}
+
+// MARK: - Message Normalization
+
+enum MessageNormalizer {
+
+    static func normalizeProjects(_ payload: AnyCodable, profile: String?) -> [ProjectSummary] {
+        let records = payload.objectValue?["projects"]?.arrayValue ?? payload.arrayValue ?? []
+        return records.compactMap { normalizeProject($0, profile: profile) }
+    }
+
+    static func normalizeProject(_ item: AnyCodable, profile: String?) -> ProjectSummary? {
+        let object = item.objectValue ?? [:]
+        let id = object["id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !id.isEmpty else { return nil }
+        let title = firstNonEmptyString([
+            object["label"], object["name"], object["title"]
+        ]) ?? "Untitled project"
+        let previews = object["preview_sessions"]?.arrayValue
+            ?? object["previewSessions"]?.arrayValue
+            ?? []
+        let folderPath = object["folders"]?.arrayValue?
+            .compactMap { $0.objectValue?["path"]?.stringValue }
+            .first
+        let count = object["session_count"]?.intValue
+            ?? object["sessionCount"]?.intValue
+            ?? object["session_count"]?.stringValue.flatMap(Int.init)
+            ?? previews.count
+        return ProjectSummary(
+            id: id,
+            title: title,
+            primaryPath: firstNonEmptyString([object["path"], object["primary_path"], object["primaryPath"]]) ?? folderPath,
+            icon: object["icon"]?.stringValue,
+            colorHex: object["color"]?.stringValue,
+            isHome: object["isNoProject"]?.boolValue ?? object["is_no_project"]?.boolValue ?? false,
+            sessionCount: count,
+            previewSessions: normalizeSessions(.array(previews), profile: profile)
+        )
+    }
+
+    static func normalizeProjectSessions(_ payload: AnyCodable, profile: String?) -> ProjectSessionDetail? {
+        guard let project = payload.objectValue?["project"]?.objectValue else { return nil }
+        let id = project["id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !id.isEmpty else { return nil }
+        let title = firstNonEmptyString([project["label"], project["name"], project["title"]]) ?? "Project"
+        let repos = project["repos"]?.arrayValue ?? []
+        let multipleRepos = repos.count > 1
+        var lanes: [ProjectSessionLane] = []
+
+        for repo in repos {
+            let repoObject = repo.objectValue ?? [:]
+            let repoLabel = firstNonEmptyString([repoObject["label"], repoObject["path"]]) ?? "Workspace"
+            for group in repoObject["groups"]?.arrayValue ?? [] {
+                let groupObject = group.objectValue ?? [:]
+                let groupID = groupObject["id"]?.stringValue ?? UUID().uuidString
+                let groupLabel = firstNonEmptyString([groupObject["label"], groupObject["path"]]) ?? "Sessions"
+                let sessions = normalizeSessions(.array(groupObject["sessions"]?.arrayValue ?? []), profile: profile)
+                guard !sessions.isEmpty else { continue }
+                lanes.append(ProjectSessionLane(
+                    id: groupID,
+                    title: multipleRepos ? "\(repoLabel) · \(groupLabel)" : groupLabel,
+                    sessions: sessions
+                ))
+            }
+        }
+
+        if lanes.isEmpty {
+            let previews = project["preview_sessions"]?.arrayValue ?? project["previewSessions"]?.arrayValue ?? []
+            let sessions = normalizeSessions(.array(previews), profile: profile)
+            if !sessions.isEmpty {
+                lanes = [ProjectSessionLane(id: "\(id)-recent", title: "Recent", sessions: sessions)]
+            }
+        }
+        return ProjectSessionDetail(id: id, title: title, lanes: lanes)
+    }
+
+    static func normalizeSessions(_ payload: AnyCodable, profile: String?) -> [SessionSummary] {
+        let records: [AnyCodable]
+        if let arr = payload.arrayValue {
+            records = arr
+        } else if let sessions = payload.objectValue?["sessions"]?.arrayValue {
+            records = sessions
+        } else {
+            records = []
+        }
+
+        return records.enumerated().map { index, item in
+            let obj = item.objectValue ?? [:]
+            let id = obj["session_id"]?.stringValue ?? obj["id"]?.stringValue ?? String(index)
+
+            // Collect alternate IDs
+            let altKeys = ["session_id", "id", "stored_session_id", "runtime_session_id", "session_key"]
+            let altIds = Set(altKeys.compactMap { obj[$0]?.stringValue }.filter { $0 != id && !$0.isEmpty })
+
+            let explicitProfile = [
+                "profile", "profile_name", "profileName", "profile_id", "profileId"
+            ]
+                .compactMap { obj[$0]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
+            let messageCount = ["message_count", "messageCount"].compactMap { key -> Int? in
+                if let count = obj[key]?.intValue {
+                    return count
+                }
+                if let count = obj[key]?.stringValue {
+                    return Int(count)
+                }
+                return nil
+            }.first
+
+            return SessionSummary(
+                id: id,
+                alternateIds: Array(altIds),
+                title: obj["title"]?.stringValue ?? obj["preview"]?.stringValue ?? "Untitled conversation",
+                model: obj["model"]?.stringValue ?? "Hermes",
+                updatedLabel: sessionUpdatedLabel(in: obj),
+                profile: explicitProfile ?? profile,
+                source: classifySource(obj),
+                isActive: false,
+                isArchived: obj["archived"]?.boolValue ?? false,
+                messageCount: messageCount,
+                lineageRootId: obj["_lineage_root_id"]?.stringValue
+            )
+        }
+    }
+
+    private static func sessionUpdatedLabel(in object: [String: AnyCodable]) -> String {
+        let keys = [
+            "last_active", "lastActive", "updated_at", "updatedAt", "updated",
+            "last_message_at", "lastMessageAt", "latest_message_at", "latestMessageAt",
+            "modified_at", "modifiedAt", "created_at", "createdAt", "timestamp", "time"
+        ]
+
+        for key in keys {
+            guard let value = object[key], value != .null else { continue }
+            switch value {
+            case .number(let timestamp):
+                return formattedSessionTimestamp(timestamp)
+            case .string(let text):
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                if let timestamp = Double(trimmed) {
+                    return formattedSessionTimestamp(timestamp)
+                }
+                return trimmed
+            default:
+                continue
+            }
+        }
+        return "recently"
+    }
+
+    private static func formattedSessionTimestamp(_ timestamp: Double) -> String {
+        let seconds = timestamp > 10_000_000_000 ? timestamp / 1_000 : timestamp
+        let date = Date(timeIntervalSince1970: seconds)
+        guard date.timeIntervalSince1970 > 0 else { return String(timestamp) }
+        if Calendar.current.isDateInToday(date) {
+            return date.formatted(date: .omitted, time: .shortened)
+        }
+        return date.formatted(.dateTime.month(.abbreviated).day().hour().minute())
+    }
+
+    static func classifySource(_ obj: [String: AnyCodable]) -> SessionSource {
+        // CRITICAL: classify BEFORE the chat whitelist (build 18 fix).
+        // discord/telegram/webhook/api are NOT in the chat whitelist, so if we
+        // test them against it, everything falls through to 'other'.
+
+        let directSources = ["source", "origin", "platform"].compactMap { obj[$0]?.stringValue?.lowercased() }.filter { !$0.isEmpty }
+        let handoffSource = (obj["handoff_platform"]?.stringValue ?? "").lowercased()
+
+        // Check for cron metadata
+        let hasCronMeta = ["cron_job_id", "cron_run_id", "scheduled_job_id", "schedule_id"].contains { obj[$0] != nil && obj[$0] != .null }
+        let sessionId = (obj["session_id"]?.stringValue ?? obj["id"]?.stringValue ?? "").lowercased()
+        let hasCronSessionId = sessionId.range(of: #"^(?:session[_:-])?cron[_:-]"#, options: .regularExpression) != nil
+        let allReported = directSources + (handoffSource.isEmpty ? [] : [handoffSource])
+        if hasCronMeta || hasCronSessionId || allReported.contains(where: {
+            $0 == "cron" || $0 == "scheduled" || $0 == "scheduler" || $0.hasPrefix("cron:") || $0.hasPrefix("cron_") || $0.hasPrefix("scheduled:")
+        }) {
+            return .cron
+        }
+
+        // Classify external sources (RETURN IMMEDIATELY — do not fall through)
+        func classify(_ source: String) -> SessionSource? {
+            switch source {
+            case "discord": return .discord
+            case "telegram": return .telegram
+            case "webhook": return .webhook
+            case "api", "api-server", "api_server", "server": return .api
+            default: return nil
+            }
+        }
+
+        if let classified = directSources.compactMap(classify).first ?? classify(handoffSource) {
+            return classified
+        }
+
+        let fallback = directSources.first ?? handoffSource
+        let chatSources = ["", "desktop", "gateway", "tui", "chat", "web", "dashboard", "mobile", "cli", "local", "default", "unknown"]
+        if chatSources.contains(fallback) { return .chat }
+        return .other
+    }
+
+    static func normalizeMessages(_ payload: [AnyCodable]) -> [ChatMessage] {
+        var messages: [ChatMessage] = []
+        var callsById = [String: ChatMessage]()
+
+        for (index, item) in payload.enumerated() {
+            let envelope = item.objectValue ?? [:]
+            // Session history can wrap the actual persisted message in a
+            // `message`, `payload`, or (when it is itself a message) `data`
+            // object. Do not merge an arbitrary `data` field from a stored
+            // tool result: those fields are often the tool's own payload.
+            let dataMessage = envelope["data"]?.objectValue.flatMap { data -> [String: AnyCodable]? in
+                (data["role"] != nil || data["type"] != nil) ? data : nil
+            }
+            let nested = envelope["message"]?.objectValue
+                ?? envelope["payload"]?.objectValue
+                ?? dataMessage
+                ?? [:]
+            let obj = envelope.merging(nested) { _, nestedValue in nestedValue }
+            let rawRole = (obj["role"]?.stringValue ?? obj["type"]?.stringValue ?? "").lowercased()
+            let isToolResult = rawRole == "tool" || rawRole.contains("tool_result") || rawRole.contains("tool-result")
+            var role: MessageRole
+            switch rawRole {
+            case "user": role = .user
+            case "system": role = .system
+            case "reasoning", "thinking": role = .reasoning
+            default: role = isToolResult ? .tool : .assistant
+            }
+            // The persisted `/messages` endpoint exposes SQLite message IDs as
+            // numbers, whereas `session.resume` often has no stable message
+            // identifier at all. Preserve either form so both sources retain
+            // a deterministic row identity.
+            let id = obj["id"]?.stringValue
+                ?? obj["id"]?.descriptiveStringValue
+                ?? obj["message_id"]?.stringValue
+                ?? obj["message_id"]?.descriptiveStringValue
+                ?? String(index)
+
+            let rawContent = isToolResult
+                ? extractToolOutput(obj)
+                : extractContent(obj["content"] ?? obj["text"] ?? .null)
+            let modelChange = modelChangeActivity(fromText: rawContent)
+            let systemNotice = systemNoticeText(fromText: rawContent)
+            if modelChange != nil || systemNotice != nil { role = .system }
+            let userContent: (content: String, rawContent: String?, attachments: [Attachment]?) = role == .user
+                ? splitUserImageReferences(rawContent, messageId: id)
+                : (content: rawContent, rawContent: nil, attachments: nil)
+            let content = modelChange.map {
+                "[Model has been changed to \($0.provider)/\($0.model)]"
+            } ?? systemNotice ?? userContent.content
+
+            let reasoning = role == .assistant ? extractContent(obj["reasoning"] ?? obj["reasoning_content"] ?? .null) : nil
+            // This deliberately follows Desktop's persisted-transcript parser:
+            // only an assistant row with an actual array of tool calls creates
+            // call cards. Treating an object-shaped `tool_calls` field as an
+            // invocation turns incidental metadata into a duplicate "Tool"
+            // card, often at the end of a later assistant reply.
+            let tools = role == .assistant ? extractToolCalls(obj) : []
+
+            if isToolResult {
+                let callId = firstNonEmptyString([
+                    obj["tool_call_id"], obj["call_id"], obj["tool_use_id"]
+                ]) ?? ""
+                let name = extractToolName(obj)
+                // An ID is authoritative. Desktop falls back to tool name only
+                // for legacy rows which genuinely have no call ID; using a
+                // name fallback after an ID mismatch can attach an old call's
+                // result to every later response.
+                let match: ChatMessage?
+                if !callId.isEmpty {
+                    match = callsById[callId]
+                } else if let name, !name.isEmpty {
+                    match = messages.reversed().first { candidate in
+                        guard let tool = candidate.tool else { return false }
+                        return tool.name == name && (tool.output?.isEmpty != false)
+                    }
+                } else {
+                    match = nil
+                }
+                if let match {
+                    var updated = match
+                    updated.tool?.output = content.isEmpty ? (match.tool?.output ?? "") : content
+                    updated.tool?.status = .complete
+                    if let idx = messages.firstIndex(where: { $0.id == match.id }) {
+                        messages[idx] = updated
+                        if !callId.isEmpty { callsById[callId] = updated }
+                    }
+                } else if let name = name as String?, !name.isEmpty {
+                    // `session.resume` exposes a compact tool row with a
+                    // context preview but deliberately omits its raw output.
+                    // Preserve that as input instead of mislabeling it as an
+                    // output after a reload.
+                    let preview = content.isEmpty ? extractToolContext(obj) : nil
+                    let m = ChatMessage(
+                        id: id, role: .tool, content: "", timestamp: extractTimestamp(obj),
+                        author: extractAuthor(obj), reasoning: nil,
+                        tool: ToolActivity(
+                            id: callId.isEmpty ? nil : callId,
+                            name: name,
+                            input: preview,
+                            output: content.isEmpty ? nil : content,
+                            status: .complete
+                        )
+                    )
+                    messages.append(m)
+                }
+                continue
+            }
+
+            if let reasoning, !reasoning.isEmpty, !isDuplicateReasoning(reasoning, content) {
+                messages.append(ChatMessage(
+                    id: "\(id)-reasoning",
+                    role: .reasoning,
+                    content: reasoning,
+                    timestamp: extractTimestamp(obj),
+                    author: extractAuthor(obj)
+                ))
+            }
+
+            let review = role == .system ? reviewActivity(from: obj, eventSessionId: nil) : nil
+            let base = ChatMessage(
+                id: id,
+                role: role,
+                content: content,
+                rawContent: modelChange == nil && systemNotice == nil ? userContent.rawContent : rawContent,
+                timestamp: extractTimestamp(obj),
+                author: extractAuthor(obj),
+                reasoning: nil,
+                review: review,
+                attachments: userContent.attachments
+            )
+
+            // External session history occasionally includes a role-less
+            // metadata envelope after the last real message. It normalizes to
+            // `.assistant` with no text or tool calls; rendering that record
+            // creates a phantom agent header with only its timestamp/actions.
+            // Keep intentionally empty user rows (they can carry a locally
+            // cached image attachment) and tool-only assistant rows, but omit
+            // an assistant row that has no visible content of its own.
+            if !content.isEmpty || (role != .assistant && tools.isEmpty) {
+                messages.append(base)
+            }
+
+            for (toolIndex, tool) in tools.enumerated() {
+                let callRow = ChatMessage(
+                    id: "\(id)-tool-\(toolIndex)", role: .tool, content: "",
+                    timestamp: base.timestamp, author: base.author, tool: tool
+                )
+                messages.append(callRow)
+                if let toolId = tool.id { callsById[toolId] = callRow }
+            }
+        }
+
+        return collapseDuplicateInterruptCorrections(in: messages)
+    }
+
+    static func modelChangeActivity(fromText text: String) -> (model: String, provider: String)? {
+        let pattern = #"^\s*\[?System:\s*The active model for this chat has changed to\s+(\S+)\s+via provider\s+(.+?)(?:\.\s+From this point forward\b|\.?\]\s*$|$)"#
+        guard let expression = try? NSRegularExpression(
+            pattern: pattern,
+            options: [.caseInsensitive]
+        ) else { return nil }
+
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = expression.firstMatch(in: text, range: range),
+              let modelRange = Range(match.range(at: 1), in: text),
+              let providerRange = Range(match.range(at: 2), in: text) else {
+            return nil
+        }
+        let model = String(text[modelRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let provider = String(text[providerRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty, !provider.isEmpty else { return nil }
+        return (model, provider)
+    }
+
+    /// Hermes persists runtime instructions as transcript messages. They are
+    /// not user prompts and should never inherit the outgoing user bubble.
+    static func systemNoticeText(fromText text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = "[System:"
+        if trimmed.lowercased().hasPrefix(prefix.lowercased()) {
+            var body = String(trimmed.dropFirst(prefix.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if body.hasSuffix("]") {
+                body.removeLast()
+                body = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            return body.isEmpty ? nil : body
+        }
+        if isUserCorrectionInterruptionNotice(trimmed) {
+            return "Response interrupted by a user correction."
+        }
+        return nil
+    }
+
+    static func isUserCorrectionInterruptionNotice(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .caseInsensitiveCompare("[This response was interrupted by a user correction.]") == .orderedSame
+    }
+
+    /// Normalizes the gateway's native clarification event. Current Hermes
+    /// sends string choices, while older integrations may send label/value
+    /// objects; accepting both keeps the card answerable across gateways.
+    static func clarifyActivity(from payload: [String: AnyCodable]) -> ClarifyActivity? {
+        let requestIDCandidates = ["request_id", "requestId", "id"]
+            .compactMap { payload[$0]?.stringValue }
+        let requestId = requestIDCandidates
+            .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let questionCandidates = ["question", "prompt", "text"]
+            .compactMap { key in payload[key].map { extractContent($0) } }
+        let question = questionCandidates
+            .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !requestId.isEmpty, !question.isEmpty else { return nil }
+
+        let rawChoices = payload["choices"]?.arrayValue ?? payload["options"]?.arrayValue ?? []
+        let choices = rawChoices.compactMap { choice -> ClarifyChoice? in
+            if let text = choice.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+                return ClarifyChoice(label: text, value: text)
+            }
+            guard let object = choice.objectValue else { return nil }
+            let labelCandidates = ["label", "title", "text", "name", "value"]
+                .compactMap { key in object[key].map { extractContent($0) } }
+            let label = labelCandidates
+                .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let valueCandidates = ["value", "answer", "id"]
+                .compactMap { key in object[key].map { extractContent($0) } }
+            let value = valueCandidates
+                .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? label
+            guard !label.isEmpty, !value.isEmpty else { return nil }
+            return ClarifyChoice(label: label, value: value)
+        }
+        let uniqueChoices = choices.reduce(into: [ClarifyChoice]()) { result, choice in
+            if !result.contains(where: { $0.value == choice.value }) { result.append(choice) }
+        }
+        return ClarifyActivity(
+            requestId: requestId,
+            question: question,
+            choices: uniqueChoices,
+            status: .pending
+        )
+    }
+
+    /// Normalizes Hermes' session-scoped command approval event. The current
+    /// gateway sends `approval.request { command, description, choices }` and
+    /// waits for `approval.respond { choice, session_id }` before continuing.
+    static func approvalActivity(
+        from payload: [String: AnyCodable],
+        sessionId: String
+    ) -> ApprovalActivity? {
+        let normalizedSessionId = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionId.isEmpty else { return nil }
+
+        let command = ["command", "code", "text"]
+            .compactMap { payload[$0]?.stringValue }
+            .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let description = ["description", "message", "prompt"]
+            .compactMap { payload[$0]?.stringValue }
+            .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "Approval required"
+        let choices = payload["choices"]?.arrayValue?
+            .compactMap { $0.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let uniqueChoices = choices.map { values in
+            values.reduce(into: [String]()) { result, value in
+                if !result.contains(value) { result.append(value) }
+            }
+        }
+
+        return ApprovalActivity(
+            sessionId: normalizedSessionId,
+            command: command,
+            description: description,
+            choices: uniqueChoices?.isEmpty == true ? nil : uniqueChoices,
+            allowPermanent: payload["allow_permanent"]?.boolValue != false,
+            smartDenied: payload["smart_denied"]?.boolValue == true,
+            status: .pending
+        )
+    }
+
+    private static func collapseDuplicateInterruptCorrections(in messages: [ChatMessage]) -> [ChatMessage] {
+        var collapsed: [ChatMessage] = []
+        for message in messages {
+            guard message.role == .user,
+                  let interruption = collapsed.last,
+                  interruption.role == .system,
+                  isUserCorrectionInterruptionNotice(interruption.rawContent ?? interruption.content),
+                  let previousUser = collapsed.dropLast().last(where: { $0.role == .user }),
+                  previousUser.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    == message.content.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                collapsed.append(message)
+                continue
+            }
+
+            // Redirect persists the correction in Hermes itself. If it is an
+            // exact repeat of the interrupted prompt, one visible bubble is
+            // enough; retain the interruption marker and original user row.
+        }
+        return collapsed
+    }
+
+    /// Desktop persists uploaded images as `@image:/gateway/path/file.ext`
+    /// tokens in the user prompt. Project those tokens into Conduit's regular
+    /// attachment model so resumed cross-client sessions keep their previews.
+    /// Retain the original prompt for replay/branch operations.
+    private static func splitUserImageReferences(
+        _ source: String,
+        messageId: String
+    ) -> (content: String, rawContent: String?, attachments: [Attachment]?) {
+        let pattern = #"@image:(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s]+))"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else {
+            return (source, nil, nil)
+        }
+
+        let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
+        let matches = expression.matches(in: source, range: fullRange)
+        guard !matches.isEmpty else { return (source, nil, nil) }
+
+        var paths: [String] = []
+        for match in matches {
+            for group in 1..<match.numberOfRanges {
+                let range = match.range(at: group)
+                guard range.location != NSNotFound,
+                      let swiftRange = Range(range, in: source) else { continue }
+                let path = String(source[swiftRange])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !path.isEmpty { paths.append(path) }
+                break
+            }
+        }
+        guard !paths.isEmpty else { return (source, nil, nil) }
+
+        var visibleContent = source
+        for match in matches.reversed() {
+            guard let range = Range(match.range, in: visibleContent) else { continue }
+            visibleContent.removeSubrange(range)
+        }
+        visibleContent = visibleContent
+            .replacingOccurrences(
+                of: #"[ \t]+\r?\n"#,
+                with: "\n",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"(?:\r?\n){3,}"#,
+                with: "\n\n",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let attachments = paths.enumerated().map { index, path in
+            let name = URL(fileURLWithPath: path).lastPathComponent
+            return Attachment(
+                id: "\(messageId)-gateway-image-\(index)",
+                name: name.isEmpty ? "Attached image" : name,
+                uri: path,
+                mimeType: imageMimeType(for: path),
+                kind: .image
+            )
+        }
+        return (visibleContent, source, attachments)
+    }
+
+    private static func imageMimeType(for path: String) -> String? {
+        switch URL(fileURLWithPath: path).pathExtension.lowercased() {
+        case "jpg", "jpeg": return "image/jpeg"
+        case "png": return "image/png"
+        case "gif": return "image/gif"
+        case "webp": return "image/webp"
+        case "heic": return "image/heic"
+        case "heif": return "image/heif"
+        case "bmp": return "image/bmp"
+        case "tif", "tiff": return "image/tiff"
+        default: return nil
+        }
+    }
+
+    static func reviewActivity(from payload: [String: AnyCodable], eventSessionId: String?) -> ReviewActivity? {
+        let text = extractContent(payload["text"] ?? payload["content"] ?? .null)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let activity = reviewActivity(fromText: text) else { return nil }
+
+        var details = activity.details ?? []
+        for key in ["details", "transcript", "messages", "output"] {
+            guard let value = payload[key], value != .null else { continue }
+            if key == "details", let values = value.arrayValue {
+                details += values.map(extractContent).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            } else {
+                let valueText = extractContent(value).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !valueText.isEmpty { details.append(valueText) }
+            }
+        }
+        let fullSessionId = ["review_session_id", "reviewSessionId", "child_session_id", "childSessionId", "maintenance_session_id"]
+            .compactMap { payload[$0]?.stringValue }
+            .first { !$0.isEmpty && $0 != eventSessionId }
+        let uniqueDetails = details.reduce(into: [String]()) { result, detail in
+            if !result.contains(detail) { result.append(detail) }
+        }
+        return ReviewActivity(
+            summary: activity.summary,
+            details: uniqueDetails.isEmpty ? nil : uniqueDetails,
+            fullSessionId: fullSessionId
+        )
+    }
+
+    static func reviewActivity(fromText text: String) -> ReviewActivity? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = "💾 Self-improvement review:"
+        guard trimmed.lowercased().hasPrefix(prefix.lowercased()) else { return nil }
+        let body = String(trimmed.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return nil }
+        let parts = body.components(separatedBy: " · ").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        let details = parts.filter { part in ["➕", "✏️", "➖"].contains { part.contains($0) } }
+        guard !details.isEmpty else { return ReviewActivity(summary: body, details: nil, fullSessionId: nil) }
+        let labels = Set(details.compactMap { detail -> String? in
+            let lower = detail.lowercased()
+            if lower.hasPrefix("user profile") { return "User profile" }
+            if lower.hasPrefix("memory") { return "Memory" }
+            if lower.hasPrefix("skill") { return "Skill" }
+            return nil
+        })
+        let summary: String
+        if labels.count == 1, let label = labels.first { summary = "\(label) updated" }
+        else if labels.count > 1 { summary = "Memory and skills updated" }
+        else { summary = "Self-improvement updates saved" }
+        return ReviewActivity(summary: summary, details: details, fullSessionId: nil)
+    }
+
+    private static func extractContent(_ value: AnyCodable) -> String {
+        switch value {
+        case .null: return ""
+        case .string(let s): return s
+        case .array(let arr): return arr.map { extractContent($0) }.joined()
+        case .object(let obj):
+            if let text = obj["text"] { return extractContent(text) }
+            if let content = obj["content"] { return extractContent(content) }
+            if let data = try? JSONSerialization.data(withJSONObject: obj.mapValues { $0.anyValue }, options: .prettyPrinted),
+               let str = String(data: data, encoding: .utf8) {
+                return str
+            }
+            return ""
+        default: return ""
+        }
+    }
+
+    private static func extractToolOutput(_ obj: [String: AnyCodable]) -> String {
+        let keys = ["result", "output", "tool_result", "response", "data", "stdout", "content", "text"]
+        var parts: [String] = []
+        for key in keys {
+            if let val = obj[key], val != .null {
+                let text = extractContent(val)
+                if !text.isEmpty { parts.append(text) }
+            }
+        }
+        return parts.joined(separator: "\n")
+    }
+
+    private static func extractToolContext(_ obj: [String: AnyCodable]) -> String? {
+        guard let context = obj["context"] else { return nil }
+        let value = extractContent(context).trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private static func extractToolCalls(_ obj: [String: AnyCodable]) -> [ToolActivity] {
+        let calls = obj["tool_calls"]?.arrayValue
+            ?? obj["tools"]?.arrayValue
+            ?? []
+        return calls.map { call in
+            let cobj = call.objectValue ?? [:]
+            let fn = cobj["function"]?.objectValue ?? cobj
+            let input = cobj["input"]?.objectValue ?? [:]
+            let output = extractToolOutput(cobj)
+            return ToolActivity(
+                id: firstNonEmptyString([cobj["id"], cobj["tool_call_id"], cobj["call_id"]]),
+                name: firstNonEmptyString([
+                    cobj["name"], cobj["tool_name"], fn["name"], input["name"]
+                ]) ?? "Tool",
+                input: {
+                    let raw = fn["arguments"] ?? cobj["input"] ?? cobj["arguments"] ?? cobj["args"] ?? cobj["command"] ?? cobj["code"] ?? .null
+                    let s = raw.descriptiveStringValue ?? extractContent(raw)
+                    return s.isEmpty ? nil : s
+                }(),
+                output: output.isEmpty ? nil : output,
+                status: .complete
+            )
+        }
+    }
+
+    private static func extractToolName(_ obj: [String: AnyCodable]) -> String? {
+        let tool = obj["tool"]?.objectValue ?? [:]
+        let function = obj["function"]?.objectValue ?? [:]
+        let input = obj["input"]?.objectValue ?? [:]
+        return firstNonEmptyString([
+            obj["tool_name"], obj["name"], function["name"], tool["name"], input["name"]
+        ])
+    }
+
+    private static func firstNonEmptyString(_ values: [AnyCodable?]) -> String? {
+        for value in values {
+            guard let text = value?.stringValue ?? value?.descriptiveStringValue else { continue }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return nil
+    }
+
+    private static func extractAuthor(_ obj: [String: AnyCodable]) -> String? {
+        let meta = obj["metadata"]?.objectValue ?? [:]
+        let candidates = [obj["profile"], obj["profile_name"], obj["author"], obj["sender"], obj["agent_name"], obj["agent"], meta["profile"], meta["profile_name"], meta["author"]]
+        for candidate in candidates {
+            if let s = candidate?.stringValue, !s.trimmingCharacters(in: .whitespaces).isEmpty {
+                return s
+            }
+        }
+        return nil
+    }
+
+    private static func extractTimestamp(_ obj: [String: AnyCodable]) -> String {
+        let meta = obj["metadata"]?.objectValue ?? obj["meta"]?.objectValue ?? [:]
+        let candidates = [
+            obj["timestamp"], obj["timestamp_ms"], obj["timestampMs"], obj["created_at"], obj["createdAt"], obj["created"], obj["created_ms"], obj["createdMs"], obj["time"], obj["ts"], obj["date"], obj["datetime"],
+            obj["updated_at"], obj["updatedAt"], obj["sent_at"], obj["sentAt"], obj["last_active"], obj["lastActive"],
+            meta["timestamp"], meta["timestamp_ms"], meta["timestampMs"], meta["created_at"], meta["createdAt"], meta["created"], meta["created_ms"], meta["createdMs"], meta["time"], meta["ts"], meta["date"], meta["datetime"],
+            meta["updated_at"], meta["updatedAt"], meta["sent_at"], meta["sentAt"], meta["last_active"], meta["lastActive"]
+        ]
+        for candidate in candidates {
+            if candidate == nil || candidate == .null { continue }
+            if let s = candidate?.stringValue { return s }
+            if let n = candidate?.doubleValue { return String(n) }
+        }
+        return ""
+    }
+
+    private static func isDuplicateReasoning(_ reasoning: String, _ content: String) -> Bool {
+        let normR = reasoning.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: .whitespaces).joined()
+        let normC = content.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: .whitespaces).joined()
+        guard !normR.isEmpty, !normC.isEmpty else { return false }
+        if normR == normC { return true }
+        let shortest = min(normR.count, normC.count)
+        return shortest >= 80 && (normR.hasPrefix(normC) || normC.hasPrefix(normR))
+    }
+}

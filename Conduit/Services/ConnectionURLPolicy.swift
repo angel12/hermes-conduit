@@ -1,0 +1,146 @@
+import Foundation
+
+enum ConnectionURLPolicyError: LocalizedError, Equatable {
+    case invalidURL
+    case insecureTransport
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidURL:
+            return "Enter a valid dashboard URL."
+        case .insecureTransport:
+            return "Remote dashboards must use HTTPS; HTTP is allowed only for localhost."
+        }
+    }
+}
+
+enum ConnectionURLPolicy {
+    static func isAllowedTransport(_ url: URL?) -> Bool {
+        guard let url,
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host,
+              !host.isEmpty,
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.user == nil,
+              components.password == nil else { return false }
+        return scheme == "https" || (scheme == "http" && isLoopbackHost(host))
+    }
+
+    static func normalizedBaseURL(_ value: String) throws -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !host.isEmpty,
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              components.url != nil else {
+            throw ConnectionURLPolicyError.invalidURL
+        }
+
+        guard scheme == "https" || scheme == "http" else {
+            throw ConnectionURLPolicyError.invalidURL
+        }
+        if scheme == "http" && !isLoopbackHost(host) {
+            throw ConnectionURLPolicyError.insecureTransport
+        }
+
+        var normalized = trimmed
+        while normalized.count > scheme.count + 3, normalized.hasSuffix("/") {
+            normalized.removeLast()
+        }
+        return normalized
+    }
+
+    static func webSocketURL(
+        baseURL: String,
+        path: String,
+        queryItems: [URLQueryItem] = []
+    ) throws -> URL {
+        let normalized = try normalizedBaseURL(baseURL)
+        guard var components = URLComponents(string: normalized),
+              let baseScheme = components.scheme?.lowercased() else {
+            throw ConnectionURLPolicyError.invalidURL
+        }
+
+        let basePath = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let routePath = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let joinedPath = [basePath, routePath].filter { !$0.isEmpty }.joined(separator: "/")
+        components.scheme = baseScheme == "https" ? "wss" : "ws"
+        components.path = "/\(joinedPath)"
+        components.queryItems = queryItems.isEmpty ? nil : queryItems
+        components.fragment = nil
+        guard let url = components.url else { throw ConnectionURLPolicyError.invalidURL }
+        return url
+    }
+
+    static func originMatches(_ url: URL?, expected: URL?) -> Bool {
+        guard let url,
+              let expected,
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased(),
+              let expectedScheme = expected.scheme?.lowercased(),
+              let expectedHost = expected.host?.lowercased() else {
+            return false
+        }
+        return originMatches(
+            scheme: scheme,
+            host: host,
+            port: url.port,
+            expectedScheme: expectedScheme,
+            expectedHost: expectedHost,
+            expectedPort: expected.port
+        )
+    }
+
+    static func originMatches(
+        scheme: String,
+        host: String,
+        port: Int,
+        expected: URL?
+    ) -> Bool {
+        guard let expected,
+              let expectedScheme = expected.scheme?.lowercased(),
+              let expectedHost = expected.host?.lowercased() else {
+            return false
+        }
+        return originMatches(
+            scheme: scheme,
+            host: host,
+            port: port,
+            expectedScheme: expectedScheme,
+            expectedHost: expectedHost,
+            expectedPort: expected.port
+        )
+    }
+
+    private static func originMatches(
+        scheme: String,
+        host: String,
+        port: Int?,
+        expectedScheme: String,
+        expectedHost: String,
+        expectedPort: Int?
+    ) -> Bool {
+        guard scheme.lowercased() == expectedScheme,
+              host.lowercased() == expectedHost else { return false }
+        return effectivePort(scheme: scheme, port: port) == effectivePort(scheme: expectedScheme, port: expectedPort)
+    }
+
+    private static func effectivePort(scheme: String, port: Int?) -> Int? {
+        if let port { return port }
+        switch scheme.lowercased() {
+        case "http", "ws": return 80
+        case "https", "wss": return 443
+        default: return nil
+        }
+    }
+
+    private static func isLoopbackHost(_ value: String) -> Bool {
+        let host = value.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        return host == "localhost" || host == "127.0.0.1" || host == "::1"
+    }
+}
