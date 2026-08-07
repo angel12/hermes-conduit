@@ -131,7 +131,9 @@ enum ConnectionURLPolicy {
     }
 
     private static func effectivePort(scheme: String, port: Int?) -> Int? {
-        if let port { return port }
+        // WKSecurityOrigin may report port 0 for default-port connections.
+        // Treat 0 the same as nil so the default scheme port is used.
+        if let port, port > 0 { return port }
         switch scheme.lowercased() {
         case "http", "ws": return 80
         case "https", "wss": return 443
