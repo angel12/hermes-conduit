@@ -56,7 +56,7 @@ hermes gateway restart
 
 Then follow the in-app pairing flow under Settings > Notifications.
 
-You can run your own push relay or use a shared one. The relay URL is configurable in the app.
+The app uses a shared relay by default (`push.milim.dev`) so notifications work out of the box with no extra setup. If you prefer to run your own relay, enter its URL under Settings > Notifications > Push relay.
 
 ## Building from source
 
