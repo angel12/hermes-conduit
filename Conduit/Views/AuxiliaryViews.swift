@@ -1206,6 +1206,7 @@ private struct AppearanceSettingsDetail: View {
 
 private struct NotificationsSettingsDetail: View {
     @ObservedObject private var notifications = PushNotificationService.shared
+    @AppStorage("conduit.relayURL") private var customRelayURL: String = 
 
     var body: some View {
         SettingsDetailContainer {
@@ -1300,6 +1301,18 @@ private struct NotificationsSettingsDetail: View {
                 }
                 ConduitSettingsSection(title: "How it works", symbol: "hand.raised", tint: .conduitAura) {
                     Text("The notifier receives a revocable credential for this phone. Your gateway never needs the phone’s push token, and you can turn notifications off here at any time.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                ConduitSettingsSection(title: "Push relay", symbol: "server.rack", tint: .conduitAura) {
+                    TextField("https://push.milim.dev", text: $customRelayURL)
+                        .textFieldStyle(.plain)
+                        .font(.body.monospaced())
+                        .padding(.vertical, 4)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                    Text("Leave blank to use the default relay. Change this if you run your own push relay server.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

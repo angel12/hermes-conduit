@@ -49,7 +49,7 @@ final class PushNotificationService: ObservableObject {
            let url = URL(string: saved) {
             return url
         }
-        return URL(string: "https://push.example.com")!
+        return URL(string: "https://push.milim.dev")!
     }
     private let bundleID = "com.milim.relay"
     private var registration: StoredRegistration?
