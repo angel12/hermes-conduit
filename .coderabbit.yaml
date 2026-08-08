@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-US"
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  collapse_walkthrough: true
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    base_branches: ["main"]
+  path_filters:
+    - "!**/reference/**"
+    - "!**/project.yml"
+    - "!**/*.xcresult"
+    - "!**/*.lock"
+  path_instructions:
+    - path: "**/*.swift"
+      instructions: |
+        This is a SwiftUI iOS app (Conduit) for Hermes Agent.
+        Focus reviews on:
+        - Concurrency safety (Swift actors, @MainActor, Sendable)
+        - Memory management (weak self in closures, retain cycles)
+        - State management correctness (@State vs @Binding vs @Published)
+        - SwiftUI view lifecycle (onAppear/task/onDisappear correctness)
+        Flag any force unwraps, implicitly unwrapped optionals, and
+        unhandled error paths as potential crashes.
+chat:
+  auto_reply: true
