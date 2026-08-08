@@ -18,6 +18,9 @@ struct LoginView: View {
     @State private var password = ""
     @State private var saveCredentials = false
     @State private var useFaceID = false
+    @State var cloudflareEnabled = false
+    @State var cloudflareClientID = ""
+    @State var cloudflareClientSecret = ""
     @State private var isConnecting = false
     @State private var showWebView = false
     @State private var error: String?
@@ -116,10 +119,33 @@ struct LoginView: View {
                     }
                     .padding(.horizontal, 2)
 
+                    VStack(alignment: .leading, spacing: 10) {
+                        Toggle("Use Cloudflare Access service token", isOn: $cloudflareEnabled)
+                            .tint(.conduitAccent)
+                        if cloudflareEnabled {
+                            TextField("Cloudflare Client ID", text: $cloudflareClientID)
+                                .textInputAutocapitalization(.never).autocorrectionDisabled()
+                                .padding(.horizontal, 14).frame(height: 50)
+                                .conduitGlassSurface(cornerRadius: 17, tint: .conduitAura.opacity(0.06))
+                            SecureField("Cloudflare Client Secret", text: $cloudflareClientSecret)
+                                .padding(.horizontal, 14).frame(height: 50)
+                                .conduitGlassSurface(cornerRadius: 17, tint: .conduitAura.opacity(0.06))
+                            Text("Used only to reach this Cloudflare-protected dashboard; the secret stays in Keychain.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.horizontal, 2)
                     if let error {
-                        Label(error, systemImage: "exclamationmark.triangle.fill")
-                            .font(.footnote)
-                            .foregroundStyle(.red)
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.footnote)
+                            Text(error)
+                                .font(.footnote)
+                                .multilineTextAlignment(.leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
                     Button {
@@ -147,10 +173,16 @@ struct LoginView: View {
         .onAppear {
             guard serverUrl.isEmpty else { return }
             serverUrl = appState.lastDashboardURL
+            if let access = KeychainHelper.loadCloudflareAccess(for: serverUrl) {
+                cloudflareEnabled = true
+                cloudflareClientID = access.clientID
+                cloudflareClientSecret = access.clientSecret
+            }
         }
         .sheet(isPresented: $showWebView) {
             AuthWebView(
                 url: serverUrl,
+                cloudflareAccess: configuredCloudflareAccess,
             onTicket: { ticket, baseUrl in
                 // The dashboard is solely an authentication bridge. Dismiss it
                 // before connection work begins so Conduit, not the dashboard,
@@ -185,10 +217,12 @@ struct LoginView: View {
         defer { isConnecting = false }
 
         do {
-            let client = NativeAuthClient(baseURL: serverUrl)
+            let access = configuredCloudflareAccess
+            let client = NativeAuthClient(baseURL: serverUrl, cloudflareAccess: access)
             let providers = try await client.authProviders()
             guard providers.contains(where: { $0["supports_password"] as? Bool == true }) else {
                 showWebView = true
+                if let access { KeychainHelper.saveCloudflareAccess(access, origin: serverUrl) }
                 return
             }
 
@@ -203,12 +237,18 @@ struct LoginView: View {
             } else {
                 KeychainHelper.clearCredentials()
             }
+            if let access { KeychainHelper.saveCloudflareAccess(access, origin: serverUrl) } else { KeychainHelper.clearCloudflareAccess() }
             await appState.connect(with: HermesConnection(baseUrl: serverUrl, ticket: ticket))
         } catch is CancellationError {
             return
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    var configuredCloudflareAccess: CloudflareAccessCredentials? {
+        guard cloudflareEnabled else { return nil }
+        return CloudflareAccessCredentials.from(clientID: cloudflareClientID, clientSecret: cloudflareClientSecret)
     }
 
     private var loginIconAssetName: String {
@@ -227,6 +267,7 @@ struct LoginView: View {
 
 struct AuthWebView: UIViewRepresentable {
     let url: String
+    let cloudflareAccess: CloudflareAccessCredentials?
     let onTicket: (String, String) -> Void
     let onError: (String) -> Void
 
@@ -234,6 +275,11 @@ struct AuthWebView: UIViewRepresentable {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         config.userContentController.add(context.coordinator, name: "ticket")
+        if let script = cloudflareAccess?.fetchInjectionUserScript, !script.isEmpty {
+            config.userContentController.addUserScript(
+                WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+            )
+        }
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         guard let normalized = try? ConnectionURLPolicy.normalizedBaseURL(url),
@@ -242,7 +288,9 @@ struct AuthWebView: UIViewRepresentable {
             return webView
         }
         let loginURL = dashboardURL.appending(path: "login")
-        webView.load(URLRequest(url: loginURL))
+        var request = URLRequest(url: loginURL)
+        request = cloudflareAccess?.applying(to: request) ?? request
+        webView.load(request)
         return webView
     }
 

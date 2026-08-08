@@ -108,15 +108,22 @@ enum DashboardTicketBridgeError: LocalizedError {
 final class DashboardTicketBridge: NSObject {
     let baseURL: String
     let webView: WKWebView
+    let cloudflareAccess: CloudflareAccessCredentials?
 
     private var isReady = false
     private var requestID = 0
     private var pendingRequests: [Int: CheckedContinuation<[String: Any], Error>] = [:]
 
-    init(baseURL: String) {
+    init(baseURL: String, cloudflareAccess: CloudflareAccessCredentials? = nil) {
         self.baseURL = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL)) ?? ""
+        self.cloudflareAccess = cloudflareAccess
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
+        if let script = cloudflareAccess?.fetchInjectionUserScript, !script.isEmpty {
+            configuration.userContentController.addUserScript(
+                WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+            )
+        }
         self.webView = WKWebView(frame: .zero, configuration: configuration)
         super.init()
         configuration.userContentController.add(self, name: "dashboard-response")
@@ -278,7 +285,9 @@ final class DashboardTicketBridge: NSObject {
     private func loadDashboardSession() {
         guard let normalized = try? ConnectionURLPolicy.normalizedBaseURL(baseURL),
               let url = URL(string: "\(normalized)/api/status") else { return }
-        webView.load(URLRequest(url: url))
+        var request = URLRequest(url: url)
+        request = cloudflareAccess?.applying(to: request) ?? request
+        webView.load(request)
     }
 
     private func rejectPending(with error: Error) {

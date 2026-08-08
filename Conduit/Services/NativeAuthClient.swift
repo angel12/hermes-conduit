@@ -41,11 +41,13 @@ enum AuthClientError: LocalizedError {
 /// DashboardTicketBridge's WebKit cookie store after sign-in.
 struct NativeAuthClient {
     let baseURL: String
+    let cloudflareAccess: CloudflareAccessCredentials?
     private let session: URLSession
 
-    init(baseURL: String) {
+    init(baseURL: String, cloudflareAccess: CloudflareAccessCredentials? = nil) {
         self.baseURL = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL))
             ?? baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        self.cloudflareAccess = cloudflareAccess
         let configuration = URLSessionConfiguration.default
         configuration.httpCookieAcceptPolicy = .always
         configuration.httpCookieStorage = HTTPCookieStorage.shared
@@ -116,7 +118,7 @@ struct NativeAuthClient {
               let url = URL(string: "\(normalized)\(path)") else {
             throw AuthClientError.invalidURL
         }
-        return URLRequest(url: url)
+        return cloudflareAccess?.applying(to: URLRequest(url: url)) ?? URLRequest(url: url)
     }
 
     private func parseError(_ data: Data) -> String? {

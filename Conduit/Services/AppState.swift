@@ -485,8 +485,25 @@ final class AppState: ObservableObject {
             defaultProfileName: defaultProfileName,
             theme: themePreference,
             busyInputMode: busyInputMode,
-            displayPreferences: displayPreferences
+            displayPreferences: displayPreferences,
+            cloudflareAccess: KeychainHelper.loadCloudflareAccess(for: connection?.baseUrl)
         )
+    }
+
+    func saveCloudflareAccess(clientID: String, clientSecret: String) {
+        if let baseURL = connection?.baseUrl,
+           let access = CloudflareAccessCredentials.from(clientID: clientID, clientSecret: clientSecret) {
+            let normalized = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL)) ?? baseURL
+            KeychainHelper.saveCloudflareAccess(access, origin: normalized)
+        } else {
+            KeychainHelper.clearCloudflareAccess()
+        }
+        if let baseURL = connection?.baseUrl { prepareDashboardBridge(for: baseURL) }
+    }
+
+    func removeCloudflareAccess() {
+        KeychainHelper.clearCloudflareAccess()
+        if let baseURL = connection?.baseUrl { prepareDashboardBridge(for: baseURL) }
     }
 
     /// Gateway profile IDs remain stable; this is only the device-local label
@@ -661,6 +678,7 @@ final class AppState: ObservableObject {
         connectedAt = nil
         KeychainHelper.clearConnection()
         KeychainHelper.clearCredentials()
+        KeychainHelper.clearCloudflareAccess()
         connection = nil
         client = nil
         dashboardTicketBridge = nil
@@ -690,7 +708,7 @@ final class AppState: ObservableObject {
     }
 
     private func makeClient(connection: HermesConnection, profile: String) -> HermesClient {
-        let client = HermesClient(connection: connection, profile: profile)
+        let client = HermesClient(connection: connection, profile: profile, cloudflareAccess: KeychainHelper.loadCloudflareAccess(for: connection.baseUrl))
         let epoch = UUID()
         activeClientEpoch = epoch
         client.onEvent = { [weak self] event in
@@ -730,7 +748,7 @@ final class AppState: ObservableObject {
         }
 
         do {
-            let ticket = try await NativeAuthClient(baseURL: credentials.baseURL).connect(
+            let ticket = try await NativeAuthClient(baseURL: credentials.baseURL, cloudflareAccess: KeychainHelper.loadCloudflareAccess(for: credentials.baseURL)).connect(
                 username: credentials.username,
                 password: credentials.password
             )
@@ -745,8 +763,9 @@ final class AppState: ObservableObject {
 
     private func prepareDashboardBridge(for baseUrl: String) {
         let normalized = baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        if dashboardTicketBridge?.baseURL != normalized {
-            dashboardTicketBridge = DashboardTicketBridge(baseURL: normalized)
+        let access = KeychainHelper.loadCloudflareAccess(for: normalized)
+        if dashboardTicketBridge?.baseURL != normalized || dashboardTicketBridge?.cloudflareAccess != access {
+            dashboardTicketBridge = DashboardTicketBridge(baseURL: normalized, cloudflareAccess: access)
         }
     }
 
@@ -1169,7 +1188,7 @@ final class AppState: ObservableObject {
                 if let credentials = KeychainHelper.loadCredentials(),
                    credentials.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == savedConnection.baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/")) {
                     do {
-                        let ticket = try await NativeAuthClient(baseURL: credentials.baseURL).connect(
+                        let ticket = try await NativeAuthClient(baseURL: credentials.baseURL, cloudflareAccess: KeychainHelper.loadCloudflareAccess(for: credentials.baseURL)).connect(
                             username: credentials.username,
                             password: credentials.password
                         )
@@ -4320,6 +4339,7 @@ enum KeychainHelper {
     private static let key = "hermes-conduit.connection.v1"
     private static let dashboardCookieKey = "hermes-conduit.dashboard-cookies.v1"
     private static let credentialsKey = "hermes-conduit.credentials.v1"
+    private static let cloudflareAccessKey = "hermes-conduit.cloudflare-access.v1"
     private static let pushRegistrationKey = "hermes-conduit.push-registration.v1"
     private static let service = "com.milim.conduit"
 
@@ -4352,6 +4372,28 @@ enum KeychainHelper {
 
     static func clearCredentials() {
         delete(account: credentialsKey)
+    }
+
+    static func saveCloudflareAccess(_ access: CloudflareAccessCredentials, origin: String) {
+        let stored = CloudflareAccessKeychainRecord(clientID: access.clientID, clientSecret: access.clientSecret, origin: origin)
+        guard let data = try? JSONEncoder().encode(stored) else { return }
+        save(data, account: cloudflareAccessKey, accessibility: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
+    }
+
+    /// Returns credentials only if the stored origin matches the given base URL.
+    /// This prevents a token saved for one gateway from leaking to a different host.
+    static func loadCloudflareAccess(for baseURL: String? = nil) -> CloudflareAccessCredentials? {
+        guard let data = load(account: cloudflareAccessKey),
+              let stored = try? JSONDecoder().decode(CloudflareAccessKeychainRecord.self, from: data) else { return nil }
+        if let baseURL {
+            let normalized = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL)) ?? baseURL
+            guard stored.origin == normalized else { return nil }
+        }
+        return stored.credentials
+    }
+
+    static func clearCloudflareAccess() {
+        delete(account: cloudflareAccessKey)
     }
 
     static func savePushRegistration(_ data: Data) {
