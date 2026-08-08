@@ -822,6 +822,7 @@ enum MarkupHTML {
         let data = (try? JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed])) ?? Data("\"\"".utf8)
         let json = String(data: data, encoding: .utf8) ?? "\"\""
         return json
+            .replacingOccurrences(of: "\\/", with: "/")
             .replacingOccurrences(of: "<", with: "\\u003c")
             .replacingOccurrences(of: "\u{2028}", with: "\\u2028")
             .replacingOccurrences(of: "\u{2029}", with: "\\u2029")

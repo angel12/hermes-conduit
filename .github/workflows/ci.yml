@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same PR/branch
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: macos-26
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: List available simulators
+        run: xcrun simctl list devices available
+
+      - name: Run tests
+        run: |
+          set -euo pipefail
+          # Find the first available iPhone simulator on this runner.
+          # macOS images change available devices across versions, so we
+          # can't hardcode "iPhone 16".
+          SIMULATOR=$(xcrun simctl list devices available -j | \
+            python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data['devices'].items():
+              if 'iOS' not in runtime:
+                  continue
+              for d in devices:
+                  if 'iPhone' in d['name']:
+                      print(d['udid'])
+                      sys.exit(0)
+          sys.exit(1)
+          ")
+
+          if [ -z "$SIMULATOR" ]; then
+            echo "::error::No iPhone simulator found"
+            exit 1
+          fi
+
+          echo "Using simulator UDID: $SIMULATOR"
+          xcodebuild test \
+            -project Conduit.xcodeproj \
+            -scheme Conduit \
+            -destination "platform=iOS Simulator,id=$SIMULATOR" \
+            -configuration Debug \
+            -resultBundlePath TestResults.xcresult \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            | xcpretty --color
+          # xcpretty masks xcodebuild's exit code. PIPESTATUS[0] is the
+          # real xcodebuild exit code.
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TestResults.xcresult
+          path: TestResults.xcresult

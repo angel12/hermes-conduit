@@ -3,7 +3,21 @@ import XCTest
 @testable import Conduit
 
 final class SecurityBoundaryTests: XCTestCase {
-    func testRemoteDashboardMustUseHTTPSButLoopbackMayUseHTTP() throws {
+    func testAppTransportSecurityAllowsTailscaleCGNATRange() throws {
+        let appInfo = try XCTUnwrap(Bundle(identifier: "com.milim.relay")?.infoDictionary)
+        let appTransportSecurity = try XCTUnwrap(
+            appInfo["NSAppTransportSecurity"] as? [String: Any]
+        )
+        let exceptionDomains = try XCTUnwrap(
+            appTransportSecurity["NSExceptionDomains"] as? [String: Any]
+        )
+        let cgnatException = try XCTUnwrap(
+            exceptionDomains["100.64.0.0/10"] as? [String: Any]
+        )
+        XCTAssertEqual(cgnatException["NSExceptionAllowsInsecureHTTPLoads"] as? Bool, true)
+    }
+
+    func testRemoteDashboardMustUseHTTPSButLoopbackAndTailscaleMayUseHTTP() throws {
         XCTAssertThrowsError(try ConnectionURLPolicy.normalizedBaseURL("http://gateway.example"))
         XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://gateway.example")))
         XCTAssertTrue(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://127.0.0.1:9120")))
@@ -15,6 +29,45 @@ final class SecurityBoundaryTests: XCTestCase {
             try ConnectionURLPolicy.normalizedBaseURL("https://gateway.example/"),
             "https://gateway.example"
         )
+        // Tailscale MagicDNS
+        XCTAssertTrue(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://my-server.tailnet-name.ts.net:9121")))
+        XCTAssertEqual(
+            try ConnectionURLPolicy.normalizedBaseURL("http://my-server.tailnet-name.ts.net:9121/"),
+            "http://my-server.tailnet-name.ts.net:9121"
+        )
+        // Tailscale CGNAT IP (100.64.0.0/10)
+        XCTAssertTrue(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.85.1.2:9121")))
+        XCTAssertEqual(
+            try ConnectionURLPolicy.normalizedBaseURL("http://100.85.1.2:9121"),
+            "http://100.85.1.2:9121"
+        )
+        // Outside CGNAT range still rejected
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.63.0.1:9121")))
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.128.0.1:9121")))
+        // Non-IPv4 label-based bypass attempts must be rejected
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64.attacker.example")))
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64.not-an-ip")))
+        // 3-octet partial addresses should not match (not a valid IPv4)
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64.1")))
+    }
+
+    func testCGNATOctetBoundaryRejectsInvalidValues() {
+        // Octet > 255 is not a valid IPv4 octet
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64.256.1")))
+        // Negative octets are invalid
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.-1.0.1")))
+        // Non-numeric octets
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64 abc.1")))
+        // 5 octets is not valid IPv4
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64.1.2.3")))
+        // Boundary: 100.63.x.x is NOT CGNAT (below range)
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.63.255.255")))
+        // Boundary: 100.128.x.x is NOT CGNAT (above range)
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.128.0.0")))
+        // Boundary: 100.64.0.0 IS CGNAT (start of range)
+        XCTAssertTrue(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64.0.0")))
+        // Boundary: 100.127.255.255 IS CGNAT (end of range)
+        XCTAssertTrue(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.127.255.255")))
     }
 
     func testWebSocketURLUsesSecureTransportAndPreservesGatewayPath() throws {
