@@ -87,7 +87,7 @@ final class StreamEventParserTests: XCTestCase {
 
     func testReasoningDeltaFallsBackToTopLevelText() {
         let event = parse(#"""
-        {"type": "message.reasoning", "session_id": "s1", "text": "top-level thought"}}
+        {"type": "message.reasoning", "session_id": "s1", "text": "top-level thought"}
         """#)
         guard case .reasoningDelta(_, let text) = event else {
             return XCTFail("Expected reasoningDelta")

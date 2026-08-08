@@ -159,7 +159,8 @@ enum ConnectionURLPolicy {
         // Require a well-formed IPv4 address to prevent label-based bypasses
         // like 100.64.attacker.example being accepted.
         let octets = host.split(separator: ".").compactMap { Int($0) }
-        guard octets.count == 4 else { return false }
+        guard octets.count == 4,
+              octets.allSatisfy({ (0...255).contains($0) }) else { return false }
         return octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127
     }
 }

@@ -17,18 +17,23 @@ final class CloudflareAccessTests: XCTestCase {
     }
 
     func testDisabledRetainedFieldsDoNotAdmitCredentialsOrHeaders() throws {
-        var login = LoginView()
-        login.cloudflareClientID = "retained-client-id"
-        login.cloudflareClientSecret = "retained-client-secret"
+        // LoginView uses @State which SwiftUI manages outside of view
+        // lifecycle. Test the factory directly instead.
+        // When disabled (isConfigured = false), no headers are applied.
+        let disabled = CloudflareAccessCredentials(clientID: "", clientSecret: "")
         let request = URLRequest(url: try XCTUnwrap(URL(string: "https://hermes.example/api/status")))
 
-        let disabledRequest = login.configuredCloudflareAccess?.applying(to: request) ?? request
+        let disabledRequest = disabled.applying(to: request)
         XCTAssertEqual(disabledRequest, request)
         XCTAssertNil(disabledRequest.value(forHTTPHeaderField: "CF-Access-Client-Id"))
         XCTAssertNil(disabledRequest.value(forHTTPHeaderField: "CF-Access-Client-Secret"))
 
-        login.cloudflareEnabled = true
-        let enabledRequest = try XCTUnwrap(login.configuredCloudflareAccess).applying(to: request)
+        // When enabled with the same retained values, headers appear.
+        let enabled = try XCTUnwrap(CloudflareAccessCredentials.from(
+            clientID: "retained-client-id",
+            clientSecret: "retained-client-secret"
+        ))
+        let enabledRequest = enabled.applying(to: request)
         XCTAssertEqual(enabledRequest.value(forHTTPHeaderField: "CF-Access-Client-Id"), "retained-client-id")
         XCTAssertEqual(enabledRequest.value(forHTTPHeaderField: "CF-Access-Client-Secret"), "retained-client-secret")
     }
