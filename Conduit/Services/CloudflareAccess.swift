@@ -8,6 +8,21 @@ struct CloudflareAccessKeychainRecord: Codable, Equatable {
     var credentials: CloudflareAccessCredentials? {
         CloudflareAccessCredentials.from(clientID: clientID, clientSecret: clientSecret)
     }
+
+    init(clientID: String, clientSecret: String, origin: String) {
+        self.clientID = clientID
+        self.clientSecret = clientSecret
+        self.origin = origin
+    }
+
+    /// Custom decode: origin defaults to "" when absent, so legacy
+    /// keychain records (pre-origin-binding) don't crash on load.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        clientID = try container.decode(String.self, forKey: .clientID)
+        clientSecret = try container.decode(String.self, forKey: .clientSecret)
+        origin = try container.decodeIfPresent(String.self, forKey: .origin) ?? ""
+    }
 }
 
 struct CloudflareAccessCredentials: Equatable, CustomStringConvertible {

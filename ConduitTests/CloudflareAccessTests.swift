@@ -115,19 +115,17 @@ final class CloudflareAccessTests: XCTestCase {
     }
 
     /// Decoding a legacy record WITHOUT an origin field (from before the
-    /// origin-binding feature was added) should not crash. The origin will
-    /// simply be empty, which means loadCloudflareAccess(for:) will never
-    /// match it and the user will be prompted to re-enter credentials.
+    /// origin-binding feature was added) must not crash. The origin field
+    /// is optional, so decoding succeeds but yields an empty origin —
+    /// which loadCloudflareAccess(for:) will correctly reject on mismatch.
     func testDecodingLegacyRecordWithoutOriginDoesNotCrash() throws {
         let legacyJSON = #"{"clientID":"old-id","clientSecret":"old-secret"}"#
         let data = legacyJSON.data(using: .utf8)!
-        // Optional decoding — if origin is non-optional, this will throw
-        // and the test documents that a migration is needed.
-        if let decoded = try? JSONDecoder().decode(CloudflareAccessKeychainRecord.self, from: data) {
-            // If it decodes, origin should be empty
-            XCTAssertTrue(decoded.origin.isEmpty)
-        }
-        // If it throws, that's also acceptable as long as the app handles
-        // the decode failure gracefully (loadCloudflareAccess returns nil)
+        // This MUST decode without throwing
+        let decoded = try JSONDecoder().decode(CloudflareAccessKeychainRecord.self, from: data)
+        // Origin must be empty so loadCloudflareAccess(for:) never matches
+        XCTAssertEqual(decoded.origin, "", "Legacy record must have empty origin")
+        // Credentials must still be present
+        XCTAssertNotNil(decoded.credentials)
     }
 }

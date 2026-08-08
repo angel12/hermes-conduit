@@ -37,6 +37,25 @@ final class SecurityBoundaryTests: XCTestCase {
         XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64.1")))
     }
 
+    func testCGNATOctetBoundaryRejectsInvalidValues() {
+        // Octet > 255 is not a valid IPv4 octet
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64.256.1")))
+        // Negative octets are invalid
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.-1.0.1")))
+        // Non-numeric octets
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64 abc.1")))
+        // 5 octets is not valid IPv4
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64.1.2.3")))
+        // Boundary: 100.63.x.x is NOT CGNAT (below range)
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.63.255.255")))
+        // Boundary: 100.128.x.x is NOT CGNAT (above range)
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.128.0.0")))
+        // Boundary: 100.64.0.0 IS CGNAT (start of range)
+        XCTAssertTrue(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64.0.0")))
+        // Boundary: 100.127.255.255 IS CGNAT (end of range)
+        XCTAssertTrue(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.127.255.255")))
+    }
+
     func testWebSocketURLUsesSecureTransportAndPreservesGatewayPath() throws {
         let url = try ConnectionURLPolicy.webSocketURL(
             baseURL: "https://gateway.example/hermes",

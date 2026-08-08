@@ -402,6 +402,95 @@ final class StreamEventParserTests: XCTestCase {
         XCTAssertEqual(activity.status, .failed)
     }
 
+    // MARK: - clarify.request
+
+    func testClarifyWithStringChoices() {
+        let event = parse(#"""
+        {"type": "clarify.request", "session_id": "s1", "payload": {"request_id": "req-1", "question": "Which env?", "choices": ["staging", "prod"]}}
+        """#)
+        guard case .clarify(let sessionId, let requestId, let question, let choices) = event else {
+            return XCTFail("Expected clarify")
+        }
+        XCTAssertEqual(sessionId, "s1")
+        XCTAssertEqual(requestId, "req-1")
+        XCTAssertEqual(question, "Which env?")
+        XCTAssertEqual(choices.count, 2)
+        XCTAssertEqual(choices[0].label, "staging")
+        XCTAssertEqual(choices[1].value, "prod")
+    }
+
+    func testClarifyWithObjectChoices() {
+        let event = parse(#"""
+        {"type": "clarify", "session_id": "s1", "payload": {"requestId": "req-2", "prompt": "Pick one", "options": [{"label": "Current", "value": "current"}]}}
+        """#)
+        guard case .clarify(_, _, _, let choices) = event else {
+            return XCTFail("Expected clarify")
+        }
+        XCTAssertEqual(choices.count, 1)
+        XCTAssertEqual(choices[0].label, "Current")
+        XCTAssertEqual(choices[0].value, "current")
+    }
+
+    func testClarifyMissingRequestIdReturnsNil() {
+        let event = parse(#"""
+        {"type": "clarify", "session_id": "s1", "payload": {"question": "No ID"}}
+        """#)
+        XCTAssertNil(event)
+    }
+
+    func testClarifyMissingQuestionReturnsNil() {
+        let event = parse(#"""
+        {"type": "clarify", "session_id": "s1", "payload": {"request_id": "req-1"}}
+        """#)
+        XCTAssertNil(event)
+    }
+
+    // MARK: - approval.request
+
+    func testApprovalRequestWithCommand() {
+        let event = parse(#"""
+        {"type": "approval.request", "session_id": "s1", "payload": {"command": "rm -rf /tmp", "description": "Clean up", "choices": ["once", "deny"]}}
+        """#)
+        guard case .approval(let sessionId, let activity) = event else {
+            return XCTFail("Expected approval")
+        }
+        XCTAssertEqual(sessionId, "s1")
+        XCTAssertEqual(activity.command, "rm -rf /tmp")
+        XCTAssertEqual(activity.description, "Clean up")
+        XCTAssertEqual(activity.choices, ["once", "deny"])
+    }
+
+    func testApprovalRequestWithFallbackDescription() {
+        let event = parse(#"""
+        {"type": "approval.request", "session_id": "s1", "payload": {}}
+        """#)
+        guard case .approval(_, let activity) = event else {
+            return XCTFail("Expected approval")
+        }
+        XCTAssertEqual(activity.description, "Approval required")
+        XCTAssertNil(activity.choices)
+    }
+
+    // MARK: - review.summary
+
+    func testReviewSummaryWithSelfImprovementText() {
+        let event = parse(#"""
+        {"type": "review.summary", "session_id": "s1", "payload": {"text": "💾 Self-improvement review: ➕ Memory: added preference"}}
+        """#)
+        guard case .reviewSummary(_, let activity) = event else {
+            return XCTFail("Expected reviewSummary")
+        }
+        XCTAssertNotNil(activity.summary)
+        XCTAssertNotNil(activity.details)
+    }
+
+    func testReviewSummaryWithNonReviewTextReturnsNil() {
+        let event = parse(#"""
+        {"type": "review.summary", "session_id": "s1", "payload": {"text": "Just a normal message"}}
+        """#)
+        XCTAssertNil(event)
+    }
+
     // MARK: - unknown events
 
     func testUnknownEventBecomesUnparsed() {
