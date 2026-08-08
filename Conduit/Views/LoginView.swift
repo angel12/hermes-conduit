@@ -166,7 +166,7 @@ struct LoginView: View {
         .onAppear {
             guard serverUrl.isEmpty else { return }
             serverUrl = appState.lastDashboardURL
-            if let access = KeychainHelper.loadCloudflareAccess() {
+            if let access = KeychainHelper.loadCloudflareAccess(for: serverUrl) {
                 cloudflareEnabled = true
                 cloudflareClientID = access.clientID
                 cloudflareClientSecret = access.clientSecret
@@ -215,7 +215,7 @@ struct LoginView: View {
             let providers = try await client.authProviders()
             guard providers.contains(where: { $0["supports_password"] as? Bool == true }) else {
                 showWebView = true
-                if let access { KeychainHelper.saveCloudflareAccess(access) }
+                if let access { KeychainHelper.saveCloudflareAccess(access, origin: serverUrl) }
                 return
             }
 
@@ -230,7 +230,7 @@ struct LoginView: View {
             } else {
                 KeychainHelper.clearCredentials()
             }
-            if let access { KeychainHelper.saveCloudflareAccess(access) } else { KeychainHelper.clearCloudflareAccess() }
+            if let access { KeychainHelper.saveCloudflareAccess(access, origin: serverUrl) } else { KeychainHelper.clearCloudflareAccess() }
             await appState.connect(with: HermesConnection(baseUrl: serverUrl, ticket: ticket))
         } catch is CancellationError {
             return
@@ -268,6 +268,11 @@ struct AuthWebView: UIViewRepresentable {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         config.userContentController.add(context.coordinator, name: "ticket")
+        if let script = cloudflareAccess?.fetchInjectionUserScript, !script.isEmpty {
+            config.userContentController.addUserScript(
+                WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+            )
+        }
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         guard let normalized = try? ConnectionURLPolicy.normalizedBaseURL(url),

@@ -156,11 +156,10 @@ enum ConnectionURLPolicy {
         // Tailscale MagicDNS: <machine>.ts.net
         if host.hasSuffix(".ts.net") { return true }
         // Tailscale CGNAT range: 100.64.0.0/10 (100.64.0.0 – 100.127.255.255)
-        if let firstOctet = host.split(separator: ".").first,
-           firstOctet == "100",
-           let secondOctet = Int(host.split(separator: ".").dropFirst().first ?? "") {
-            return secondOctet >= 64 && secondOctet <= 127
-        }
-        return false
+        // Require a well-formed IPv4 address to prevent label-based bypasses
+        // like 100.64.attacker.example being accepted.
+        let octets = host.split(separator: ".").compactMap { Int($0) }
+        guard octets.count == 4 else { return false }
+        return octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127
     }
 }

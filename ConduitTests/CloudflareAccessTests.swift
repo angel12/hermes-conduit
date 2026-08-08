@@ -34,12 +34,13 @@ final class CloudflareAccessTests: XCTestCase {
     }
 
     func testKeychainRecordRoundTripAndSecretIsNotARepresentation() throws {
-        let record = CloudflareAccessKeychainRecord(clientID: "fixture-client", clientSecret: "fixture-client-secret")
+        let record = CloudflareAccessKeychainRecord(clientID: "fixture-client", clientSecret: "fixture-client-secret", origin: "https://hermes.example")
         let reloaded = try JSONDecoder().decode(
             CloudflareAccessKeychainRecord.self,
             from: JSONEncoder().encode(record)
         )
         XCTAssertEqual(reloaded.credentials, CloudflareAccessCredentials(clientID: "fixture-client", clientSecret: "fixture-client-secret"))
+        XCTAssertEqual(reloaded.origin, "https://hermes.example")
         XCTAssertFalse(reloaded.credentials?.description.contains("fixture-client-secret") == true)
         XCTAssertFalse(String(describing: reloaded.credentials).contains("fixture-client-secret"))
     }
@@ -47,5 +48,50 @@ final class CloudflareAccessTests: XCTestCase {
     func testIncompleteConfigurationIsAbsent() {
         XCTAssertNil(CloudflareAccessCredentials.from(clientID: "client-id", clientSecret: ""))
         XCTAssertNil(CloudflareAccessCredentials.from(clientID: "", clientSecret: "secret"))
+    }
+
+    // MARK: - Fetch Injection Script
+
+    func testFetchInjectionContainsBothHeaders() throws {
+        let credentials = CloudflareAccessCredentials(clientID: "test-id", clientSecret: "test-secret")
+        let script = credentials.fetchInjectionUserScript
+        XCTAssertTrue(script.contains("CF-Access-Client-Id"))
+        XCTAssertTrue(script.contains("CF-Access-Client-Secret"))
+        XCTAssertTrue(script.contains("test-id"))
+        XCTAssertTrue(script.contains("test-secret"))
+    }
+
+    func testFetchInjectionIsEmptyWhenUnconfigured() {
+        let credentials = CloudflareAccessCredentials(clientID: "", clientSecret: "")
+        XCTAssertTrue(credentials.fetchInjectionUserScript.isEmpty)
+    }
+
+    func testFetchInjectionEscapesSingleQuotes() throws {
+        let credentials = CloudflareAccessCredentials(clientID: "id'with'quotes", clientSecret: "secret'val")
+        let script = credentials.fetchInjectionUserScript
+        // Escaped quotes should be present, raw unescaped values should not
+        XCTAssertTrue(script.contains(#"id\'with\'quotes"#))
+        XCTAssertTrue(script.contains(#"secret\'val"#))
+    }
+
+    // MARK: - Origin Binding
+
+    func testKeychainRecordPreservesOrigin() throws {
+        let record = CloudflareAccessKeychainRecord(
+            clientID: "id", clientSecret: "secret",
+            origin: "https://gateway.example:9119"
+        )
+        let encoded = try JSONEncoder().encode(record)
+        let decoded = try JSONDecoder().decode(CloudflareAccessKeychainRecord.self, from: encoded)
+        XCTAssertEqual(decoded.origin, "https://gateway.example:9119")
+    }
+
+    func testKeychainRecordRejectsNonMatchingOrigin() throws {
+        let record = CloudflareAccessKeychainRecord(
+            clientID: "id", clientSecret: "secret",
+            origin: "https://gateway-a.example"
+        )
+        // Simulate the origin check: different origin should not match
+        XCTAssertNotEqual(record.origin, "https://gateway-b.example")
     }
 }

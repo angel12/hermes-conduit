@@ -119,6 +119,11 @@ final class DashboardTicketBridge: NSObject {
         self.cloudflareAccess = cloudflareAccess
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
+        if let script = cloudflareAccess?.fetchInjectionUserScript, !script.isEmpty {
+            configuration.userContentController.addUserScript(
+                WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+            )
+        }
         self.webView = WKWebView(frame: .zero, configuration: configuration)
         super.init()
         configuration.userContentController.add(self, name: "dashboard-response")

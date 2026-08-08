@@ -444,13 +444,15 @@ final class AppState: ObservableObject {
             theme: themePreference,
             busyInputMode: busyInputMode,
             displayPreferences: displayPreferences,
-            cloudflareAccess: KeychainHelper.loadCloudflareAccess()
+            cloudflareAccess: KeychainHelper.loadCloudflareAccess(for: connection?.baseUrl)
         )
     }
 
     func saveCloudflareAccess(clientID: String, clientSecret: String) {
-        if let access = CloudflareAccessCredentials.from(clientID: clientID, clientSecret: clientSecret) {
-            KeychainHelper.saveCloudflareAccess(access)
+        if let baseURL = connection?.baseUrl,
+           let access = CloudflareAccessCredentials.from(clientID: clientID, clientSecret: clientSecret) {
+            let normalized = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL)) ?? baseURL
+            KeychainHelper.saveCloudflareAccess(access, origin: normalized)
         } else {
             KeychainHelper.clearCloudflareAccess()
         }
@@ -664,7 +666,7 @@ final class AppState: ObservableObject {
     }
 
     private func makeClient(connection: HermesConnection, profile: String) -> HermesClient {
-        let client = HermesClient(connection: connection, profile: profile, cloudflareAccess: KeychainHelper.loadCloudflareAccess())
+        let client = HermesClient(connection: connection, profile: profile, cloudflareAccess: KeychainHelper.loadCloudflareAccess(for: connection.baseUrl))
         let epoch = UUID()
         activeClientEpoch = epoch
         client.onEvent = { [weak self] event in
@@ -704,7 +706,7 @@ final class AppState: ObservableObject {
         }
 
         do {
-            let ticket = try await NativeAuthClient(baseURL: credentials.baseURL, cloudflareAccess: KeychainHelper.loadCloudflareAccess()).connect(
+            let ticket = try await NativeAuthClient(baseURL: credentials.baseURL, cloudflareAccess: KeychainHelper.loadCloudflareAccess(for: credentials.baseURL)).connect(
                 username: credentials.username,
                 password: credentials.password
             )
@@ -719,7 +721,7 @@ final class AppState: ObservableObject {
 
     private func prepareDashboardBridge(for baseUrl: String) {
         let normalized = baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let access = KeychainHelper.loadCloudflareAccess()
+        let access = KeychainHelper.loadCloudflareAccess(for: normalized)
         if dashboardTicketBridge?.baseURL != normalized || dashboardTicketBridge?.cloudflareAccess != access {
             dashboardTicketBridge = DashboardTicketBridge(baseURL: normalized, cloudflareAccess: access)
         }
@@ -1144,7 +1146,7 @@ final class AppState: ObservableObject {
                 if let credentials = KeychainHelper.loadCredentials(),
                    credentials.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == savedConnection.baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/")) {
                     do {
-                        let ticket = try await NativeAuthClient(baseURL: credentials.baseURL, cloudflareAccess: KeychainHelper.loadCloudflareAccess()).connect(
+                        let ticket = try await NativeAuthClient(baseURL: credentials.baseURL, cloudflareAccess: KeychainHelper.loadCloudflareAccess(for: credentials.baseURL)).connect(
                             username: credentials.username,
                             password: credentials.password
                         )
@@ -4315,15 +4317,21 @@ enum KeychainHelper {
         delete(account: credentialsKey)
     }
 
-    static func saveCloudflareAccess(_ access: CloudflareAccessCredentials) {
-        let stored = CloudflareAccessKeychainRecord(clientID: access.clientID, clientSecret: access.clientSecret)
+    static func saveCloudflareAccess(_ access: CloudflareAccessCredentials, origin: String) {
+        let stored = CloudflareAccessKeychainRecord(clientID: access.clientID, clientSecret: access.clientSecret, origin: origin)
         guard let data = try? JSONEncoder().encode(stored) else { return }
         save(data, account: cloudflareAccessKey, accessibility: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
     }
 
-    static func loadCloudflareAccess() -> CloudflareAccessCredentials? {
+    /// Returns credentials only if the stored origin matches the given base URL.
+    /// This prevents a token saved for one gateway from leaking to a different host.
+    static func loadCloudflareAccess(for baseURL: String? = nil) -> CloudflareAccessCredentials? {
         guard let data = load(account: cloudflareAccessKey),
               let stored = try? JSONDecoder().decode(CloudflareAccessKeychainRecord.self, from: data) else { return nil }
+        if let baseURL {
+            let normalized = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL)) ?? baseURL
+            guard stored.origin == normalized else { return nil }
+        }
         return stored.credentials
     }
 

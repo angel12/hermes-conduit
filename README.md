@@ -43,7 +43,7 @@ Start a conversation on desktop, pick it up on your phone. The session list is t
 
 If your server is not on your local network, use Tailscale or a reverse proxy to reach it from your phone. Plain HTTP over Tailscale (MagicDNS `.ts.net` domains and `100.64.0.0/10` tailnet IPs) is supported — the traffic is already WireGuard-encrypted.
 
-If the dashboard is behind Cloudflare Access, enable the optional service token in Settings > Connection > Gateway. Conduit keeps the client secret in Keychain and sends both Access headers on native authentication, the initial WebKit dashboard navigation, and each WebSocket handshake. WebKit does not reliably propagate custom navigation headers to later JavaScript fetches; the initial Access response must establish its normal session cookie for ticket requests to continue. Hermes' existing dashboard authentication and ticket flow remains unchanged.
+If the dashboard is behind Cloudflare Access, enable the optional service token on the login screen or in Settings > Connection > Gateway. Conduit stores the client secret in Keychain (scoped to the gateway origin), and injects both Access headers into native authentication requests, WebSocket handshakes, and all in-page WebKit fetches via a document-start user script. Credentials are bound to the gateway URL and cleared when switching to a different host.
 
 ## Push Notifications
 

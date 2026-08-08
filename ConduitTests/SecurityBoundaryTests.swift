@@ -30,6 +30,11 @@ final class SecurityBoundaryTests: XCTestCase {
         // Outside CGNAT range still rejected
         XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.63.0.1:9121")))
         XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.128.0.1:9121")))
+        // Non-IPv4 label-based bypass attempts must be rejected
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64.attacker.example")))
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64.not-an-ip")))
+        // 3-octet partial addresses should not match (not a valid IPv4)
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.64.1")))
     }
 
     func testWebSocketURLUsesSecureTransportAndPreservesGatewayPath() throws {
