@@ -3,6 +3,20 @@ import XCTest
 @testable import Conduit
 
 final class SecurityBoundaryTests: XCTestCase {
+    func testAppTransportSecurityAllowsTailscaleCGNATRange() throws {
+        let appInfo = try XCTUnwrap(Bundle(identifier: "com.milim.relay")?.infoDictionary)
+        let appTransportSecurity = try XCTUnwrap(
+            appInfo["NSAppTransportSecurity"] as? [String: Any]
+        )
+        let exceptionDomains = try XCTUnwrap(
+            appTransportSecurity["NSExceptionDomains"] as? [String: Any]
+        )
+        let cgnatException = try XCTUnwrap(
+            exceptionDomains["100.64.0.0/10"] as? [String: Any]
+        )
+        XCTAssertEqual(cgnatException["NSExceptionAllowsInsecureHTTPLoads"] as? Bool, true)
+    }
+
     func testRemoteDashboardMustUseHTTPSButLoopbackAndTailscaleMayUseHTTP() throws {
         XCTAssertThrowsError(try ConnectionURLPolicy.normalizedBaseURL("http://gateway.example"))
         XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://gateway.example")))
