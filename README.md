@@ -41,7 +41,7 @@ Start a conversation on desktop, pick it up on your phone. The session list is t
 
 **Note:** Conduit connects to the native Hermes dashboard, not the WebUI. The default port is 9119.
 
-If your server is not on your local network, use Tailscale or a reverse proxy to reach it from your phone.
+If your server is not on your local network, use Tailscale or a reverse proxy to reach it from your phone. Plain HTTP over Tailscale (MagicDNS `.ts.net` domains and `100.64.0.0/10` tailnet IPs) is supported — the traffic is already WireGuard-encrypted.
 
 If the dashboard is behind Cloudflare Access, enable the optional service token in Settings > Connection > Gateway. Conduit keeps the client secret in Keychain and sends both Access headers on native authentication, the initial WebKit dashboard navigation, and each WebSocket handshake. WebKit does not reliably propagate custom navigation headers to later JavaScript fetches; the initial Access response must establish its normal session cookie for ticket requests to continue. Hermes' existing dashboard authentication and ticket flow remains unchanged.
 

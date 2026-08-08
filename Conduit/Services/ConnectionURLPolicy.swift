@@ -9,7 +9,7 @@ enum ConnectionURLPolicyError: LocalizedError, Equatable {
         case .invalidURL:
             return "Enter a valid dashboard URL."
         case .insecureTransport:
-            return "Remote dashboards must use HTTPS; HTTP is allowed only for localhost."
+            return "Remote dashboards must use HTTPS; HTTP is allowed only for localhost and Tailscale tailnet hosts."
         }
     }
 }
@@ -23,7 +23,7 @@ enum ConnectionURLPolicy {
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               components.user == nil,
               components.password == nil else { return false }
-        return scheme == "https" || (scheme == "http" && isLoopbackHost(host))
+        return scheme == "https" || (scheme == "http" && isInsecureTransportAllowed(host))
     }
 
     static func normalizedBaseURL(_ value: String) throws -> String {
@@ -44,7 +44,7 @@ enum ConnectionURLPolicy {
         guard scheme == "https" || scheme == "http" else {
             throw ConnectionURLPolicyError.invalidURL
         }
-        if scheme == "http" && !isLoopbackHost(host) {
+        if scheme == "http" && !isInsecureTransportAllowed(host) {
             throw ConnectionURLPolicyError.insecureTransport
         }
 
@@ -141,8 +141,26 @@ enum ConnectionURLPolicy {
         }
     }
 
+    private static func isInsecureTransportAllowed(_ value: String) -> Bool {
+        let host = value.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        return isLoopbackHost(host) || isTailscaleHost(host)
+    }
+
     private static func isLoopbackHost(_ value: String) -> Bool {
         let host = value.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
         return host == "localhost" || host == "127.0.0.1" || host == "::1"
+    }
+
+    private static func isTailscaleHost(_ value: String) -> Bool {
+        let host = value.lowercased()
+        // Tailscale MagicDNS: <machine>.ts.net
+        if host.hasSuffix(".ts.net") { return true }
+        // Tailscale CGNAT range: 100.64.0.0/10 (100.64.0.0 – 100.127.255.255)
+        if let firstOctet = host.split(separator: ".").first,
+           firstOctet == "100",
+           let secondOctet = Int(host.split(separator: ".").dropFirst().first ?? "") {
+            return secondOctet >= 64 && secondOctet <= 127
+        }
+        return false
     }
 }

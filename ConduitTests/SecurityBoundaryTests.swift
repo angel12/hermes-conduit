@@ -3,7 +3,7 @@ import XCTest
 @testable import Conduit
 
 final class SecurityBoundaryTests: XCTestCase {
-    func testRemoteDashboardMustUseHTTPSButLoopbackMayUseHTTP() throws {
+    func testRemoteDashboardMustUseHTTPSButLoopbackAndTailscaleMayUseHTTP() throws {
         XCTAssertThrowsError(try ConnectionURLPolicy.normalizedBaseURL("http://gateway.example"))
         XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://gateway.example")))
         XCTAssertTrue(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://127.0.0.1:9120")))
@@ -15,6 +15,21 @@ final class SecurityBoundaryTests: XCTestCase {
             try ConnectionURLPolicy.normalizedBaseURL("https://gateway.example/"),
             "https://gateway.example"
         )
+        // Tailscale MagicDNS
+        XCTAssertTrue(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://my-server.tailnet-name.ts.net:9121")))
+        XCTAssertEqual(
+            try ConnectionURLPolicy.normalizedBaseURL("http://my-server.tailnet-name.ts.net:9121/"),
+            "http://my-server.tailnet-name.ts.net:9121"
+        )
+        // Tailscale CGNAT IP (100.64.0.0/10)
+        XCTAssertTrue(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.85.1.2:9121")))
+        XCTAssertEqual(
+            try ConnectionURLPolicy.normalizedBaseURL("http://100.85.1.2:9121"),
+            "http://100.85.1.2:9121"
+        )
+        // Outside CGNAT range still rejected
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.63.0.1:9121")))
+        XCTAssertFalse(ConnectionURLPolicy.isAllowedTransport(URL(string: "http://100.128.0.1:9121")))
     }
 
     func testWebSocketURLUsesSecureTransportAndPreservesGatewayPath() throws {
