@@ -18,6 +18,9 @@ struct LoginView: View {
     @State private var password = ""
     @State private var saveCredentials = false
     @State private var useFaceID = false
+    @State private var cloudflareEnabled = false
+    @State private var cloudflareClientID = ""
+    @State private var cloudflareClientSecret = ""
     @State private var isConnecting = false
     @State private var showWebView = false
     @State private var error: String?
@@ -116,6 +119,22 @@ struct LoginView: View {
                     }
                     .padding(.horizontal, 2)
 
+                    VStack(alignment: .leading, spacing: 10) {
+                        Toggle("Use Cloudflare Access service token", isOn: $cloudflareEnabled)
+                            .tint(.conduitAccent)
+                        if cloudflareEnabled {
+                            TextField("Cloudflare Client ID", text: $cloudflareClientID)
+                                .textInputAutocapitalization(.never).autocorrectionDisabled()
+                                .padding(.horizontal, 14).frame(height: 50)
+                                .conduitGlassSurface(cornerRadius: 17, tint: .conduitAura.opacity(0.06))
+                            SecureField("Cloudflare Client Secret", text: $cloudflareClientSecret)
+                                .padding(.horizontal, 14).frame(height: 50)
+                                .conduitGlassSurface(cornerRadius: 17, tint: .conduitAura.opacity(0.06))
+                            Text("Used only to reach this Cloudflare-protected dashboard; the secret stays in Keychain.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.horizontal, 2)
                     if let error {
                         Label(error, systemImage: "exclamationmark.triangle.fill")
                             .font(.footnote)
@@ -147,10 +166,16 @@ struct LoginView: View {
         .onAppear {
             guard serverUrl.isEmpty else { return }
             serverUrl = appState.lastDashboardURL
+            if let access = KeychainHelper.loadCloudflareAccess() {
+                cloudflareEnabled = true
+                cloudflareClientID = access.clientID
+                cloudflareClientSecret = access.clientSecret
+            }
         }
         .sheet(isPresented: $showWebView) {
             AuthWebView(
                 url: serverUrl,
+                cloudflareAccess: configuredCloudflareAccess,
             onTicket: { ticket, baseUrl in
                 // The dashboard is solely an authentication bridge. Dismiss it
                 // before connection work begins so Conduit, not the dashboard,
@@ -185,10 +210,12 @@ struct LoginView: View {
         defer { isConnecting = false }
 
         do {
-            let client = NativeAuthClient(baseURL: serverUrl)
+            let access = configuredCloudflareAccess
+            let client = NativeAuthClient(baseURL: serverUrl, cloudflareAccess: access)
             let providers = try await client.authProviders()
             guard providers.contains(where: { $0["supports_password"] as? Bool == true }) else {
                 showWebView = true
+                if let access { KeychainHelper.saveCloudflareAccess(access) }
                 return
             }
 
@@ -203,12 +230,17 @@ struct LoginView: View {
             } else {
                 KeychainHelper.clearCredentials()
             }
+            if let access { KeychainHelper.saveCloudflareAccess(access) } else { KeychainHelper.clearCloudflareAccess() }
             await appState.connect(with: HermesConnection(baseUrl: serverUrl, ticket: ticket))
         } catch is CancellationError {
             return
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    private var configuredCloudflareAccess: CloudflareAccessCredentials? {
+        CloudflareAccessCredentials.from(clientID: cloudflareClientID, clientSecret: cloudflareClientSecret)
     }
 
     private var loginIconAssetName: String {
@@ -227,6 +259,7 @@ struct LoginView: View {
 
 struct AuthWebView: UIViewRepresentable {
     let url: String
+    let cloudflareAccess: CloudflareAccessCredentials?
     let onTicket: (String, String) -> Void
     let onError: (String) -> Void
 
@@ -242,7 +275,9 @@ struct AuthWebView: UIViewRepresentable {
             return webView
         }
         let loginURL = dashboardURL.appending(path: "login")
-        webView.load(URLRequest(url: loginURL))
+        var request = URLRequest(url: loginURL)
+        request = cloudflareAccess?.applying(to: request) ?? request
+        webView.load(request)
         return webView
     }
 

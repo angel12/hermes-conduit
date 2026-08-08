@@ -339,6 +339,7 @@ final class HermesClient: ObservableObject {
 
     let connection: HermesConnection
     let profile: String?
+    let cloudflareAccess: CloudflareAccessCredentials?
 
     // Callback for stream events (set by AppState)
     var onEvent: ((StreamEvent) -> Void)?
@@ -348,9 +349,10 @@ final class HermesClient: ObservableObject {
     static let promptSubmitTimeout: TimeInterval = 180 // 3 minutes
     static let titleGenerationTimeout: TimeInterval = 90
 
-    init(connection: HermesConnection, profile: String? = nil) {
+    init(connection: HermesConnection, profile: String? = nil, cloudflareAccess: CloudflareAccessCredentials? = nil) {
         self.connection = connection
         self.profile = profile
+        self.cloudflareAccess = cloudflareAccess
     }
 
     // MARK: - Connection
@@ -382,7 +384,9 @@ final class HermesClient: ObservableObject {
         self.session = session
         self.socketDelegate = socketDelegate
 
-        let socket = session.webSocketTask(with: url)
+        var request = URLRequest(url: url)
+        request = cloudflareAccess?.applying(to: request) ?? request
+        let socket = session.webSocketTask(with: request)
         self.socket = socket
         socket.resume()
         try await waitForSocketOpen(socket)

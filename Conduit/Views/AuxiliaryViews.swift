@@ -111,6 +111,7 @@ struct SettingsSnapshot: Identifiable {
     let theme: ThemePreference
     let busyInputMode: BusyInputMode
     let displayPreferences: ProfileDisplayPreferences
+    let cloudflareAccess: CloudflareAccessCredentials?
 }
 
 private struct LegacySettingsView: View {
@@ -543,7 +544,7 @@ struct SettingsView: View {
                 fields: Self.memoryFields
             )
         case .gateway:
-            GatewaySettingsDetail(snapshot: snapshot, reconnect: reconnect, disconnect: disconnect, close: { dismiss() })
+            GatewaySettingsDetail(snapshot: snapshot, reconnect: reconnect, disconnect: disconnect, close: { dismiss() }, saveCloudflareAccess: appState.saveCloudflareAccess, removeCloudflareAccess: appState.removeCloudflareAccess)
         case .appearance:
             AppearanceSettingsDetail(theme: appState.themePreference, saveTheme: saveTheme)
         case .notifications:
@@ -1117,12 +1118,20 @@ private struct GatewaySettingsDetail: View {
     let reconnect: () async -> Bool
     let disconnect: () -> Void
     let close: () -> Void
+    let saveCloudflareAccess: (String, String) -> Void
+    let removeCloudflareAccess: () -> Void
     @State private var connected: Bool
     @State private var reconnecting = false
+    @State private var cloudflareEnabled: Bool
+    @State private var clientID: String
+    @State private var clientSecret = ""
 
-    init(snapshot: SettingsSnapshot, reconnect: @escaping () async -> Bool, disconnect: @escaping () -> Void, close: @escaping () -> Void) {
+    init(snapshot: SettingsSnapshot, reconnect: @escaping () async -> Bool, disconnect: @escaping () -> Void, close: @escaping () -> Void, saveCloudflareAccess: @escaping (String, String) -> Void, removeCloudflareAccess: @escaping () -> Void) {
         self.snapshot = snapshot; self.reconnect = reconnect; self.disconnect = disconnect; self.close = close
+        self.saveCloudflareAccess = saveCloudflareAccess; self.removeCloudflareAccess = removeCloudflareAccess
         _connected = State(initialValue: snapshot.isConnected)
+        _cloudflareEnabled = State(initialValue: snapshot.cloudflareAccess != nil)
+        _clientID = State(initialValue: snapshot.cloudflareAccess?.clientID ?? "")
     }
     var body: some View {
         SettingsDetailContainer {
@@ -1131,6 +1140,21 @@ private struct GatewaySettingsDetail: View {
                 SettingsMetricRow(label: "Status", value: connected ? "Connected" : "Disconnected", valueColor: connected ? .green : .red, statusDot: connected ? .green : .red)
                 Button { Task { reconnecting = true; connected = await reconnect(); reconnecting = false } } label: { Label(reconnecting ? "Reconnecting…" : "Reconnect", systemImage: "arrow.clockwise").frame(maxWidth: .infinity).frame(height: 44) }
                     .disabled(reconnecting).conduitGlassControl(cornerRadius: 16, tint: .conduitAura.opacity(0.12))
+            }
+            ConduitSettingsSection(title: "Cloudflare Access", symbol: "shield.lefthalf.filled", tint: .conduitAccent) {
+                Toggle("Use service token", isOn: Binding(get: { cloudflareEnabled }, set: { enabled in
+                    cloudflareEnabled = enabled
+                    if !enabled { clientSecret = ""; removeCloudflareAccess() }
+                }))
+                if cloudflareEnabled {
+                    TextField("Client ID", text: $clientID).textInputAutocapitalization(.never).autocorrectionDisabled()
+                        .textFieldStyle(.roundedBorder)
+                    SecureField("Client Secret", text: $clientSecret).textFieldStyle(.roundedBorder)
+                    Button("Save token") { saveCloudflareAccess(clientID, clientSecret); clientSecret = "" }
+                        .buttonStyle(.borderedProminent).tint(.conduitAccent)
+                    Text("The secret is stored only in Keychain. Reconnect after changing it.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
             }
             Button(role: .destructive) { disconnect(); close() } label: { Label("Disconnect from Hermes", systemImage: "rectangle.portrait.and.arrow.right").frame(maxWidth: .infinity).frame(height: 48) }
                 .conduitGlassControl(cornerRadius: 18, tint: .red.opacity(0.18))

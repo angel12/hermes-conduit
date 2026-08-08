@@ -43,6 +43,8 @@ Start a conversation on desktop, pick it up on your phone. The session list is t
 
 If your server is not on your local network, use Tailscale or a reverse proxy to reach it from your phone.
 
+If the dashboard is behind Cloudflare Access, enable the optional service token in Settings > Connection > Gateway. Conduit keeps the client secret in Keychain and sends both Access headers on native authentication, the initial WebKit dashboard navigation, and each WebSocket handshake. WebKit does not reliably propagate custom navigation headers to later JavaScript fetches; the initial Access response must establish its normal session cookie for ticket requests to continue. Hermes' existing dashboard authentication and ticket flow remains unchanged.
+
 ## Push Notifications
 
 Push notifications require a small relay service because iOS does not allow apps to maintain persistent background connections. The relay source is in the `hermes-conduit-notifier` plugin and the push relay server.
