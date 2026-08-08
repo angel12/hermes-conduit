@@ -26,9 +26,11 @@ final class InterfaceOrientationTests: XCTestCase {
             info["UISupportedInterfaceOrientations~ipad"] as? [String],
             [
                 "UIInterfaceOrientationPortrait",
+                "UIInterfaceOrientationPortraitUpsideDown",
                 "UIInterfaceOrientationLandscapeLeft",
                 "UIInterfaceOrientationLandscapeRight"
             ]
         )
+        XCTAssertNil(info["UIRequiresFullScreen"])
     }
 }
