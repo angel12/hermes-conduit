@@ -16,6 +16,23 @@ final class CloudflareAccessTests: XCTestCase {
         XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
     }
 
+    func testDisabledRetainedFieldsDoNotAdmitCredentialsOrHeaders() throws {
+        var login = LoginView()
+        login.cloudflareClientID = "retained-client-id"
+        login.cloudflareClientSecret = "retained-client-secret"
+        let request = URLRequest(url: try XCTUnwrap(URL(string: "https://hermes.example/api/status")))
+
+        let disabledRequest = login.configuredCloudflareAccess?.applying(to: request) ?? request
+        XCTAssertEqual(disabledRequest, request)
+        XCTAssertNil(disabledRequest.value(forHTTPHeaderField: "CF-Access-Client-Id"))
+        XCTAssertNil(disabledRequest.value(forHTTPHeaderField: "CF-Access-Client-Secret"))
+
+        login.cloudflareEnabled = true
+        let enabledRequest = try XCTUnwrap(login.configuredCloudflareAccess).applying(to: request)
+        XCTAssertEqual(enabledRequest.value(forHTTPHeaderField: "CF-Access-Client-Id"), "retained-client-id")
+        XCTAssertEqual(enabledRequest.value(forHTTPHeaderField: "CF-Access-Client-Secret"), "retained-client-secret")
+    }
+
     func testKeychainRecordRoundTripAndSecretIsNotARepresentation() throws {
         let record = CloudflareAccessKeychainRecord(clientID: "fixture-client", clientSecret: "fixture-client-secret")
         let reloaded = try JSONDecoder().decode(

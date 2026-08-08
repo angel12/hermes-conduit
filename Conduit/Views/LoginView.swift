@@ -18,9 +18,9 @@ struct LoginView: View {
     @State private var password = ""
     @State private var saveCredentials = false
     @State private var useFaceID = false
-    @State private var cloudflareEnabled = false
-    @State private var cloudflareClientID = ""
-    @State private var cloudflareClientSecret = ""
+    @State var cloudflareEnabled = false
+    @State var cloudflareClientID = ""
+    @State var cloudflareClientSecret = ""
     @State private var isConnecting = false
     @State private var showWebView = false
     @State private var error: String?
@@ -239,8 +239,9 @@ struct LoginView: View {
         }
     }
 
-    private var configuredCloudflareAccess: CloudflareAccessCredentials? {
-        CloudflareAccessCredentials.from(clientID: cloudflareClientID, clientSecret: cloudflareClientSecret)
+    var configuredCloudflareAccess: CloudflareAccessCredentials? {
+        guard cloudflareEnabled else { return nil }
+        return CloudflareAccessCredentials.from(clientID: cloudflareClientID, clientSecret: cloudflareClientSecret)
     }
 
     private var loginIconAssetName: String {
