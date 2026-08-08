@@ -224,6 +224,12 @@ final class AppState: ObservableObject {
     private var lastStreamingPublishDate: Date?
     private var scenePhaseTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
+    /// Coalesces presentation-cache flushes during streaming so we
+    /// don't serialize and write UserDefaults on every WebSocket frame.
+    private var presentationCacheFlushTask: Task<Void, Never>?
+    /// Timestamp of the last successful coalesced cache flush; used to
+    /// enforce a maximum 5-second interval even during continuous streaming.
+    private var lastPresentationCacheFlushDate: Date?
     /// Hermes currently starts its automatic title task against the launch
     /// profile's database. Keep a small, one-per-session recovery task for a
     /// secondary profile, then stand down as soon as Hermes has written one.
@@ -262,6 +268,42 @@ final class AppState: ObservableObject {
             reconciliation?.resolvedSessionId
         ].compactMap { $0 }
         sessionPresentationCache.save(messages, profile: activeProfile, sessionIDs: ids)
+    }
+
+    /// Coalesces presentation-cache writes during streaming. Instead of
+    /// serializing the entire message array to UserDefaults on every
+    /// WebSocket frame (30+ times/sec), batch flushes at most once every
+    /// 2 seconds (debounce), with a hard 5-second ceiling (max interval)
+    /// so continuous streaming can never postpone a flush indefinitely.
+    private func schedulePresentationCacheFlush(for sessionId: String) {
+        presentationCacheFlushTask?.cancel()
+        let now = Date()
+        let sinceLastFlush = lastPresentationCacheFlushDate
+            .map { now.timeIntervalSince($0) }
+            ?? .infinity
+        // If 5s already elapsed since the last successful write, flush
+        // immediately rather than scheduling another debounce.
+        let delay: Duration = sinceLastFlush >= 5 ? .zero : .seconds(2)
+        presentationCacheFlushTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: delay)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.cacheMessagePresentation(for: [sessionId])
+            self.lastPresentationCacheFlushDate = Date()
+            self.presentationCacheFlushTask = nil
+        }
+    }
+
+    /// Flushes any pending presentation-cache write immediately (used on
+    /// session switch, completion, and scene-phase change).
+    private func flushPendingPresentationCache() {
+        presentationCacheFlushTask?.cancel()
+        presentationCacheFlushTask = nil
+        lastPresentationCacheFlushDate = Date()
+        cacheMessagePresentation()
     }
 
     // MARK: - Persistence
@@ -1223,6 +1265,9 @@ final class AppState: ObservableObject {
         case .background:
             voiceConversationController.setForegroundActive(false)
             showVoiceSheet = false
+            // Flush any pending coalesced cache writes before the app
+            // suspends — iOS may kill the process before the debounce fires.
+            flushPendingPresentationCache()
             // A suspended socket may still look open. Invalidate incomplete
             // snapshots so foreground always obtains a fresh authoritative one.
             invalidateReconciliation()
@@ -1422,7 +1467,16 @@ final class AppState: ObservableObject {
             errorMessage = "That conversation belongs to another workspace. Switch profiles to open it."
             return false
         }
-        cacheMessagePresentation()
+        // Atomically switch session identity BEFORE clearing the transcript.
+        // This prevents stale stream events from the old session falling
+        // through `eventBelongsToActiveSession` and repopulating the
+        // cleared message array while reconciliation is in flight.
+        flushPendingPresentationCache()
+        setActiveSessionState(id: sessionId)
+        messages = []
+        clearStreamingText()
+        activeAssistantMessageId = nil
+        activeReasoningMessageId = nil
         updateActiveSessionTitle(for: sessionId)
         let token = beginReconciliation()
         return await reconcile(sessionId: sessionId, using: client, token: token)
@@ -3415,7 +3469,7 @@ final class AppState: ObservableObject {
     private func applyStreamEvent(_ event: StreamEvent) {
         let streamSessionId = sessionID(for: event)
         guard eventBelongsToActiveSession(streamSessionId) else { return }
-        defer { cacheMessagePresentation(for: [streamSessionId]) }
+        defer { schedulePresentationCacheFlush(for: streamSessionId) }
 
         switch event {
         case .messageStart:
@@ -4227,6 +4281,9 @@ final class AppState: ObservableObject {
         activeReasoningMessageId = nil
         receivedReasoningForCurrentTurn = false
         setRunning(false)
+        // Cancel any pending coalesced flush and write immediately — the
+        // turn is complete so all messages are in their final state.
+        flushPendingPresentationCache()
         cacheMessagePresentation(for: [sessionId])
 
         if displayRole == .assistant,
