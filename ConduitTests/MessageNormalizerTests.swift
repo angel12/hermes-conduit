@@ -1,6 +1,7 @@
 import XCTest
 @testable import Conduit
 
+@MainActor
 final class MessageNormalizerTests: XCTestCase {
     func testRuntimeSnapshotReadsLiveAssistantProjection() {
         let snapshot = SessionRuntimeSnapshot(
