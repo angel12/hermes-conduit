@@ -8,8 +8,8 @@ jobs:
     permissions:
       id-token: write
       contents: read
-      pull-requests: read
-      issues: read
+      pull-requests: write
+      issues: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -17,8 +17,10 @@ jobs:
       - uses: anomalyco/opencode/github@latest
         env:
           OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           model: go-custom/deepseek-v4-flash
+          use_github_token: true
           prompt: |
             Review this pull request:
             - Check for code quality issues
