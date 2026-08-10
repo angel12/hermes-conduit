@@ -28,24 +28,44 @@ struct MarkdownText: View {
 
     var body: some View {
         let blocks = MarkdownParser.parse(source, recognizesGatewayMedia: gatewayMediaDataURL != nil)
-        VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { index, block in
-                MarkdownBlockView(
-                    block: block,
-                    foregroundStyle: foregroundStyle,
-                    usesAccentSurface: usesAccentSurface,
-                    gatewayMediaDataURL: gatewayMediaDataURL,
-                    newestCharacterOpacities: index == blocks.count - 1
-                        ? newestCharacterOpacities
-                        : []
+        let selectableText = MarkdownSelectionFormatter.attributedText(
+            for: blocks,
+            foregroundStyle: foregroundStyle,
+            usesAccentSurface: usesAccentSurface,
+            newestCharacterOpacities: newestCharacterOpacities
+        )
+
+        Group {
+            if let selectableText {
+                SelectableTextView(
+                    attributedText: selectableText,
+                    font: .preferredFont(forTextStyle: .body),
+                    textColor: usesAccentSurface ? .white : UIColor(foregroundStyle),
+                    lineSpacing: 4,
+                    linkColor: usesAccentSurface ? .white : .link
                 )
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(Array(blocks.enumerated()), id: \.offset) { index, block in
+                        MarkdownBlockView(
+                            block: block,
+                            foregroundStyle: foregroundStyle,
+                            usesAccentSurface: usesAccentSurface,
+                            gatewayMediaDataURL: gatewayMediaDataURL,
+                            newestCharacterOpacities: index == blocks.count - 1
+                                ? newestCharacterOpacities
+                                : []
+                        )
+                    }
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
-private enum MarkdownBlock {
+enum MarkdownBlock {
     case heading(level: Int, text: String)
     case paragraph(String)
     case quote([MarkdownQuoteLine])
@@ -60,12 +80,209 @@ private enum MarkdownBlock {
     case divider
 }
 
-private struct MarkdownQuoteLine {
+struct MarkdownQuoteLine {
     let depth: Int
     let text: String
 }
 
-private enum MarkdownTableAlignment {
+enum MarkdownSelectionFormatter {
+    static func attributedText(
+        for blocks: [MarkdownBlock],
+        foregroundStyle: Color,
+        usesAccentSurface: Bool,
+        newestCharacterOpacities: [Double]
+    ) -> NSAttributedString? {
+        guard !blocks.isEmpty, blocks.allSatisfy(\.isSelectableFlowBlock) else { return nil }
+
+        let bodyFont = UIFont.preferredFont(forTextStyle: .body)
+        let textColor = usesAccentSurface ? UIColor.white : UIColor(foregroundStyle)
+        let linkColor = usesAccentSurface ? UIColor.white : UIColor.link
+        let result = NSMutableAttributedString()
+
+        for (index, block) in blocks.enumerated() {
+            guard let segment = segment(
+                for: block,
+                bodyFont: bodyFont,
+                textColor: textColor,
+                linkColor: linkColor,
+                usesAccentSurface: usesAccentSurface,
+                foregroundStyle: foregroundStyle
+            ) else {
+                return nil
+            }
+
+            if index > 0 {
+                result.append(NSAttributedString(
+                    string: "\n\n",
+                    attributes: [
+                        .font: bodyFont,
+                        .foregroundColor: textColor
+                    ]
+                ))
+            }
+            result.append(segment)
+        }
+
+        applyTrailingCharacterOpacities(newestCharacterOpacities, to: result, baseColor: textColor)
+        return result
+    }
+
+    private static func segment(
+        for block: MarkdownBlock,
+        bodyFont: UIFont,
+        textColor: UIColor,
+        linkColor: UIColor,
+        usesAccentSurface: Bool,
+        foregroundStyle: Color
+    ) -> NSAttributedString? {
+        switch block {
+        case .heading(let level, let text):
+            return inline(
+                text,
+                font: headingFont(level),
+                textColor: textColor,
+                linkColor: linkColor
+            )
+
+        case .paragraph(let text):
+            return inline(text, font: bodyFont, textColor: textColor, linkColor: linkColor)
+
+        case .unorderedList(let items):
+            return list(
+                items,
+                ordered: false,
+                bodyFont: bodyFont,
+                textColor: textColor,
+                linkColor: linkColor,
+                markerColor: usesAccentSurface ? .white : UIColor(Color.conduitAccent)
+            )
+
+        case .orderedList(let items):
+            return list(
+                items,
+                ordered: true,
+                bodyFont: bodyFont,
+                textColor: textColor,
+                linkColor: linkColor,
+                markerColor: usesAccentSurface ? .white : UIColor(Color.conduitAccent)
+            )
+
+        case .quote(let lines):
+            let result = NSMutableAttributedString()
+            let quoteColor = usesAccentSurface
+                ? UIColor.white.withAlphaComponent(0.90)
+                : UIColor(foregroundStyle).withAlphaComponent(0.90)
+            let quoteFont = bodyFont.withTraits(.traitItalic)
+
+            for (index, line) in lines.enumerated() {
+                if index > 0 {
+                    result.append(NSAttributedString(string: "\n"))
+                }
+                let marker = String(repeating: "│ ", count: max(line.depth, 1))
+                result.append(NSAttributedString(
+                    string: marker,
+                    attributes: [
+                        .font: bodyFont,
+                        .foregroundColor: quoteColor
+                    ]
+                ))
+                result.append(inline(line.text, font: quoteFont, textColor: quoteColor, linkColor: linkColor))
+            }
+            return result
+
+        default:
+            return nil
+        }
+    }
+
+    private static func list(
+        _ items: [String],
+        ordered: Bool,
+        bodyFont: UIFont,
+        textColor: UIColor,
+        linkColor: UIColor,
+        markerColor: UIColor
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let markerFont = bodyFont.withTraits(.traitBold)
+
+        for (index, item) in items.enumerated() {
+            if index > 0 {
+                result.append(NSAttributedString(string: "\n"))
+            }
+
+            let task = MarkdownParser.taskItem(item)
+            let marker: String
+            if let task {
+                marker = task.complete ? "☑ " : "☐ "
+            } else {
+                marker = ordered ? "\(index + 1). " : "• "
+            }
+            result.append(NSAttributedString(
+                string: marker,
+                attributes: [
+                    .font: markerFont,
+                    .foregroundColor: markerColor
+                ]
+            ))
+            result.append(inline(
+                task?.text ?? item,
+                font: bodyFont,
+                textColor: textColor,
+                linkColor: linkColor
+            ))
+        }
+        return result
+    }
+
+    private static func inline(
+        _ source: String,
+        font: UIFont,
+        textColor: UIColor,
+        linkColor: UIColor
+    ) -> NSAttributedString {
+        let attributed = (try? AttributedString(
+            markdown: source,
+            options: .init(interpretedSyntax: .full)
+        )) ?? AttributedString(source)
+        return SelectableTextView.bridge(attributed, defaultFont: font, defaultColor: textColor, linkColor: linkColor)
+    }
+
+    private static func headingFont(_ level: Int) -> UIFont {
+        MarkdownHeading.font(for: level)
+    }
+
+    private static func applyTrailingCharacterOpacities(
+        _ opacities: [Double],
+        to text: NSMutableAttributedString,
+        baseColor: UIColor
+    ) {
+        guard !opacities.isEmpty, text.length > 0 else { return }
+        var location = text.length
+        for opacity in opacities.reversed() {
+            guard location > 0 else { break }
+            location -= 1
+            text.addAttribute(
+                .foregroundColor,
+                value: baseColor.withAlphaComponent(CGFloat(opacity)),
+                range: NSRange(location: location, length: 1)
+            )
+        }
+    }
+}
+
+private extension MarkdownBlock {
+    var isSelectableFlowBlock: Bool {
+        switch self {
+        case .heading, .paragraph, .quote, .unorderedList, .orderedList:
+            true
+        default:
+            false
+        }
+    }
+}
+
+enum MarkdownTableAlignment {
     case leading, center, trailing
 
     var swiftUI: Alignment {
@@ -73,6 +290,19 @@ private enum MarkdownTableAlignment {
         case .leading: .leading
         case .center: .center
         case .trailing: .trailing
+        }
+    }
+}
+
+/// Shared heading font logic used by both MarkdownSelectionFormatter
+/// and MarkdownBlockView to prevent divergence.
+enum MarkdownHeading {
+    static func font(for level: Int) -> UIFont {
+        switch level {
+        case 1: UIFont.preferredFont(forTextStyle: .title2).withTraits(.traitBold)
+        case 2: UIFont.preferredFont(forTextStyle: .title3).withTraits(.traitBold)
+        case 3: UIFont.preferredFont(forTextStyle: .headline).withTraits(.traitBold)
+        default: UIFont.preferredFont(forTextStyle: .subheadline).withTraits(.traitBold)
         }
     }
 }
@@ -91,10 +321,9 @@ private struct MarkdownBlockView: View {
                 source: text,
                 foregroundStyle: foregroundStyle,
                 usesAccentSurface: usesAccentSurface,
+                font: headingFont(level),
                 trailingCharacterOpacities: newestCharacterOpacities
             )
-                .font(headingFont(level))
-                .fontWeight(.bold)
                 .padding(.top, level <= 2 ? 6 : 2)
 
         case .paragraph(let text):
@@ -102,10 +331,9 @@ private struct MarkdownBlockView: View {
                 source: text,
                 foregroundStyle: foregroundStyle,
                 usesAccentSurface: usesAccentSurface,
+                lineSpacing: 4,
                 trailingCharacterOpacities: newestCharacterOpacities
             )
-                .font(.body)
-                .lineSpacing(4)
 
         case .quote(let lines):
             MarkdownQuote(
@@ -180,13 +408,8 @@ private struct MarkdownBlockView: View {
         }
     }
 
-    private func headingFont(_ level: Int) -> Font {
-        switch level {
-        case 1: .title2
-        case 2: .title3
-        case 3: .headline
-        default: .subheadline
-        }
+    private func headingFont(_ level: Int) -> UIFont {
+        MarkdownHeading.font(for: level)
     }
 }
 
@@ -194,6 +417,9 @@ private struct InlineMarkdown: View {
     let source: String
     let foregroundStyle: Color
     let usesAccentSurface: Bool
+    var font: UIFont = .preferredFont(forTextStyle: .body)
+    var lineSpacing: CGFloat = 0
+    var maximumNumberOfLines: Int = 0
     var trailingCharacterOpacities: [Double] = []
 
     private var attributed: AttributedString {
@@ -213,9 +439,15 @@ private struct InlineMarkdown: View {
     }
 
     var body: some View {
-        Text(attributed)
-            .foregroundStyle(foregroundStyle)
-            .tint(usesAccentSurface ? Color.white.opacity(0.92) : .conduitAccent)
+        SelectableTextView(
+            attributedText: attributed,
+            font: font,
+            textColor: usesAccentSurface ? .white : UIColor(foregroundStyle),
+            lineSpacing: lineSpacing,
+            maximumNumberOfLines: maximumNumberOfLines,
+            linkColor: usesAccentSurface ? .white : .link
+        )
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -247,12 +479,11 @@ private struct MarkdownList: View {
                         source: task?.text ?? item,
                         foregroundStyle: foregroundStyle,
                         usesAccentSurface: usesAccentSurface,
+                        lineSpacing: 3,
                         trailingCharacterOpacities: index == items.count - 1
                             ? trailingCharacterOpacities
                             : []
                     )
-                        .font(.body)
-                        .lineSpacing(3)
                 }
             }
         }
@@ -295,13 +526,12 @@ private struct MarkdownQuote: View {
                             source: line.text,
                             foregroundStyle: foregroundStyle.opacity(0.90),
                             usesAccentSurface: usesAccentSurface,
+                            font: UIFont.preferredFont(forTextStyle: .body).withTraits(.traitItalic),
+                            lineSpacing: 3,
                             trailingCharacterOpacities: index == lines.count - 1
                                 ? trailingCharacterOpacities
                                 : []
                         )
-                            .font(.body)
-                            .italic()
-                            .lineSpacing(3)
                     }
                 }
             }
@@ -341,10 +571,9 @@ private struct MarkdownCallout: View {
                 source: text,
                 foregroundStyle: foregroundStyle,
                 usesAccentSurface: usesAccentSurface,
+                lineSpacing: 3,
                 trailingCharacterOpacities: trailingCharacterOpacities
             )
-                .font(.body)
-                .lineSpacing(3)
         }
         .padding(12)
         .background(detail.color.opacity(0.10), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
@@ -368,12 +597,11 @@ private struct MarkdownColumns: View {
                     source: column,
                     foregroundStyle: foregroundStyle,
                     usesAccentSurface: usesAccentSurface,
+                    lineSpacing: 3,
                     trailingCharacterOpacities: index == columns.count - 1
                         ? trailingCharacterOpacities
                         : []
                 )
-                    .font(.body)
-                    .lineSpacing(3)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(12)
                 if index < columns.count - 1 {
@@ -422,9 +650,15 @@ private struct MarkdownTable: View {
     private func tableRow(_ cells: [String], isHeader: Bool) -> some View {
         HStack(spacing: 0) {
             ForEach(Array(cells.enumerated()), id: \.offset) { index, cell in
-                InlineMarkdown(source: cell, foregroundStyle: foregroundStyle, usesAccentSurface: usesAccentSurface)
-                    .font(isHeader ? .caption.weight(.bold) : .footnote)
-                    .lineLimit(4)
+                InlineMarkdown(
+                    source: cell,
+                    foregroundStyle: foregroundStyle,
+                    usesAccentSurface: usesAccentSurface,
+                    font: isHeader
+                        ? UIFont.preferredFont(forTextStyle: .caption1).withTraits(.traitBold)
+                        : UIFont.preferredFont(forTextStyle: .footnote),
+                    maximumNumberOfLines: 4
+                )
                     .frame(minWidth: 112, maxWidth: 220, alignment: alignment(at: index).swiftUI)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 9)
@@ -647,15 +881,24 @@ struct ChatCodeBlock: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 Group {
                     if usesAccentSurface {
-                        Text(source).foregroundStyle(Color.white.opacity(0.96))
+                        SelectableTextView(
+                            text: source,
+                            font: .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .footnote).pointSize, weight: .regular),
+                            textColor: UIColor.white.withAlphaComponent(0.96),
+                            lineSpacing: 3,
+                            wrapsLines: false
+                        )
                     } else {
-                        Text(SyntaxHighlighter.highlight(source, language: normalizedLanguage))
+                        SelectableTextView(
+                            attributedText: SyntaxHighlighter.highlight(source, language: normalizedLanguage),
+                            font: .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .footnote).pointSize, weight: .regular),
+                            textColor: .label,
+                            lineSpacing: 3,
+                            wrapsLines: false
+                        )
                     }
                 }
-                .font(.system(.footnote, design: .monospaced))
-                .lineSpacing(3)
                 .padding(12)
-                .textSelection(.enabled)
             }
         }
         .background(
@@ -716,7 +959,12 @@ private struct RenderCard: View {
             }
             Button(action: action) { Label(actionTitle, systemImage: actionIcon).font(.caption.weight(.semibold)) }
                 .tint(.conduitAccent)
-            Text(source).font(.system(.caption, design: .monospaced)).lineLimit(5).textSelection(.enabled)
+            SelectableTextView(
+                text: source,
+                font: .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .caption1).pointSize, weight: .regular),
+                textColor: .label,
+                maximumNumberOfLines: 5
+            )
         }
         .padding(12)
         .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
@@ -742,7 +990,15 @@ private struct MarkupPreviewSheet: View {
                 SafeMarkupWebView(html: preview.kind == .mermaid ? MermaidHTML.render(source: preview.source, light: preview.light) : KaTeXHTML.render(source: preview.source, light: preview.light))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 Divider()
-                ScrollView(.horizontal, showsIndicators: false) { Text(preview.source).font(.system(.caption, design: .monospaced)).padding(12).textSelection(.enabled) }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    SelectableTextView(
+                        text: preview.source,
+                        font: .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .caption1).pointSize, weight: .regular),
+                        textColor: .label,
+                        wrapsLines: false
+                    )
+                    .padding(12)
+                }
                     .frame(maxHeight: 96)
             }
             .navigationTitle(preview.kind == .mermaid ? "Diagram" : "Formula")
@@ -829,7 +1085,7 @@ enum MarkupHTML {
     }
 }
 
-private enum MarkdownParser {
+enum MarkdownParser {
     static func parse(_ source: String, recognizesGatewayMedia: Bool = false) -> [MarkdownBlock] {
         let lines = source.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
         var blocks: [MarkdownBlock] = []

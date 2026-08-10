@@ -488,7 +488,6 @@ struct AssistantBubble: View {
                         await appState.gatewayMediaDataURL(for: path, profile: appState.activeProfile)
                     }
                 )
-                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
@@ -612,9 +611,12 @@ private struct ReviewSummaryCard: View {
                             .font(.caption2.weight(.bold))
                             .tracking(0.6)
                             .foregroundStyle(.secondary)
-                        Text(activity.summary)
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.primary)
+                        SelectableTextView(
+                            text: activity.summary,
+                            font: .preferredFont(forTextStyle: .subheadline).withTraits(.traitBold),
+                            textColor: .label
+                        )
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     Spacer(minLength: 8)
                     MessageTimestampLabel(timestamp: timestamp, tone: .supporting)
@@ -622,19 +624,23 @@ private struct ReviewSummaryCard: View {
                         Image(systemName: expanded ? "chevron.up" : "chevron.down")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
+                            .frame(width: 28, height: 28)
                     }
                 }
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(details.isEmpty)
+            .accessibilityLabel(details.isEmpty ? activity.summary : (expanded ? "Collapse review details" : "Expand review details"))
 
             if expanded, !details.isEmpty {
                 VStack(alignment: .leading, spacing: 12) {
                     ForEach(Array(details.enumerated()), id: \.offset) { _, detail in
-                        Text(detail)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+                        SelectableTextView(
+                            text: detail,
+                            font: .preferredFont(forTextStyle: .callout),
+                            textColor: .secondaryLabel
+                        )
                     }
                 }
                 .padding(.top, 2)
@@ -679,9 +685,12 @@ private struct ModelChangeSummaryCard: View {
                     .font(.caption2.weight(.bold))
                     .tracking(0.6)
                     .foregroundStyle(.secondary)
-                Text("Model has been changed to \(provider)/\(model)")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.primary)
+                SelectableTextView(
+                    text: "Model has been changed to \(provider)/\(model)",
+                    font: .preferredFont(forTextStyle: .subheadline).withTraits(.traitBold),
+                    textColor: .label
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             Spacer(minLength: 8)
@@ -711,10 +720,11 @@ struct ThinkingCard: View {
                 )
 
                 DisclosureGroup(isExpanded: $expanded) {
-                    Text(message.content)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
+                    SelectableTextView(
+                        text: message.content,
+                        font: .preferredFont(forTextStyle: .callout),
+                        textColor: .secondaryLabel
+                    )
                         .padding(.top, 4)
                 } label: {
                     HStack(spacing: 6) {
@@ -828,16 +838,21 @@ struct ToolCard: View {
                                     .foregroundStyle(.tertiary)
                             }
                         }
-                        if !expanded, let preview = collapsedPreview(for: tool) {
-                            Text(preview)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(Color.primary.opacity(0.74))
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                        }
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
+                }
+
+                if !expanded, let preview = collapsedPreview(for: tool) {
+                    SelectableTextView(
+                        text: preview,
+                        font: .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .caption2).pointSize, weight: .regular),
+                        textColor: UIColor(Color.primary.opacity(0.74)),
+                        maximumNumberOfLines: 1
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
                 }
 
                 if expanded {
@@ -847,9 +862,12 @@ struct ToolCard: View {
                                 Text("Input")
                                     .font(.caption2.bold())
                                     .foregroundStyle(.tertiary)
-                                Text(input)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundStyle(.secondary)
+                                SelectableTextView(
+                                    text: Self.truncateForDisplay(input, maxLines: 500),
+                                    font: .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .caption1).pointSize, weight: .regular),
+                                    textColor: .secondaryLabel,
+                                    maximumNumberOfLines: 0
+                                )
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
                         }
@@ -858,10 +876,12 @@ struct ToolCard: View {
                                 Text("Output")
                                     .font(.caption2.bold())
                                     .foregroundStyle(.tertiary)
-                                Text(output)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(expanded ? nil : 3)
+                                SelectableTextView(
+                                    text: Self.truncateForDisplay(output, maxLines: 500),
+                                    font: .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .caption1).pointSize, weight: .regular),
+                                    textColor: .secondaryLabel,
+                                    maximumNumberOfLines: 0
+                                )
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
                         }
@@ -887,6 +907,16 @@ struct ToolCard: View {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return preview.isEmpty ? nil : preview
     }
+
+    /// Limits tool output rendered in the non-scrolling SelectableTextView to
+    /// avoid a single massive layout pass when expanding large command logs or
+    /// file reads. Returns the original string if under the cap; otherwise
+    /// truncates to the first `maxLines` lines with an ellipsis indicator.
+    static func truncateForDisplay(_ text: String, maxLines: Int) -> String {
+        let lines = text.components(separatedBy: "\n")
+        guard lines.count > maxLines else { return text }
+        return lines.prefix(maxLines).joined(separator: "\n") + "\n… (\(lines.count - maxLines) more lines)"
+    }
 }
 
 // MARK: - Clarify Card
@@ -907,8 +937,12 @@ struct ClarifyCard: View {
                             .font(.caption2.weight(.bold))
                             .tracking(0.5)
                             .foregroundStyle(statusColor(for: clarify.status))
-                        Text(clarify.question)
-                            .font(.subheadline.bold())
+                        SelectableTextView(
+                            text: clarify.question,
+                            font: .preferredFont(forTextStyle: .subheadline).withTraits(.traitBold),
+                            textColor: .label
+                        )
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     Spacer(minLength: 8)
                     if clarify.status == .submitting {
@@ -926,8 +960,11 @@ struct ClarifyCard: View {
                             .font(.caption2.weight(.bold))
                             .tracking(0.5)
                             .foregroundStyle(.green)
-                        Text(answer)
-                            .font(.subheadline)
+                        SelectableTextView(
+                            text: answer,
+                            font: .preferredFont(forTextStyle: .subheadline),
+                            textColor: .label
+                        )
                     }
                     .padding(12)
                     .background(Color.green.opacity(0.10), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -1037,8 +1074,12 @@ struct ApprovalCard: View {
                             .font(.caption2.weight(.bold))
                             .tracking(0.5)
                             .foregroundStyle(statusColor(for: approval.status))
-                        Text(approval.description)
-                            .font(.subheadline.bold())
+                        SelectableTextView(
+                            text: approval.description,
+                            font: .preferredFont(forTextStyle: .subheadline).withTraits(.traitBold),
+                            textColor: .label
+                        )
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     Spacer(minLength: 8)
                     if approval.status == .submitting {
@@ -1051,10 +1092,12 @@ struct ApprovalCard: View {
                 }
 
                 if !approval.command.isEmpty {
-                    Text(approval.command)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .lineLimit(5)
+                    SelectableTextView(
+                        text: approval.command,
+                        font: .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .caption1).pointSize, weight: .regular),
+                        textColor: .label,
+                        maximumNumberOfLines: 5
+                    )
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(12)
                         .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -1209,7 +1252,6 @@ struct StreamingBubble: View {
                     await appState.gatewayMediaDataURL(for: path, profile: appState.activeProfile)
                 }
             )
-            .textSelection(.disabled)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
