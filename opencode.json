@@ -9,8 +9,8 @@
         "apiKey": "{env:OPENCODE_GO_API_KEY}"
       },
       "models": {
-        "mimo-v2.5": {
-          "name": "MiMo V2.5"
+        "deepseek-v4-flash": {
+          "name": "DeepSeek V4 Flash"
         }
       }
     }
