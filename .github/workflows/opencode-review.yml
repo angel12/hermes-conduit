@@ -18,7 +18,7 @@ jobs:
         env:
           OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
         with:
-          model: opencode-go/deepseek-v4-flash
+          model: opencode-go/mimo-v2.5
           prompt: |
             Review this pull request:
             - Check for code quality issues
