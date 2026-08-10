@@ -22,9 +22,31 @@ jobs:
           model: go-custom/deepseek-v4-flash
           use_github_token: true
           prompt: |
-            Review this pull request:
-            - Check for code quality issues
-            - Look for potential bugs
-            - Suggest improvements
-            Focus on Swift/iOS-specific concerns: retain cycles, force unwraps,
-            concurrency issues, SwiftUI lifecycle bugs, and accessibility.
+            You are a code reviewer. DO NOT modify any files. DO NOT make commits.
+            DO NOT run builds or tests.
+
+            Output a structured code review as your final message. Use this format:
+
+            ## Summary
+            (1-2 sentences on what this PR does)
+
+            ## Findings
+            For each issue found, write:
+            ### [severity: critical/major/minor/nit] Title
+            **File:** path:line
+            **Issue:** What's wrong
+            **Suggestion:** How to fix it
+
+            ## Verdict
+            APPROVE / REQUEST_CHANGES / COMMENT
+
+            Focus areas for Swift/iOS:
+            - Retain cycles (weak self in closures, especially Combine subscriptions)
+            - Force unwraps (!) and implicitly unwrapped optionals
+            - Concurrency issues (data races, MainActor violations, Swift 6 strict concurrency)
+            - SwiftUI lifecycle bugs (onAppear side effects, state management, body re-renders)
+            - Accessibility (missing labels, traits, dynamic type support)
+            - Memory leaks and resource cleanup
+
+            If you find no issues, say so explicitly. Do NOT summarize what you did
+            or describe your process. Output only the review.
