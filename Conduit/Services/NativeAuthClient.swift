@@ -44,15 +44,19 @@ struct NativeAuthClient {
     let cloudflareAccess: CloudflareAccessCredentials?
     private let session: URLSession
 
-    init(baseURL: String, cloudflareAccess: CloudflareAccessCredentials? = nil) {
+    init(
+        baseURL: String,
+        cloudflareAccess: CloudflareAccessCredentials? = nil,
+        sessionConfiguration: URLSessionConfiguration? = nil
+    ) {
         self.baseURL = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL))
             ?? baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         self.cloudflareAccess = cloudflareAccess
-        let configuration = URLSessionConfiguration.default
+        let configuration = sessionConfiguration ?? URLSessionConfiguration.default
         configuration.httpCookieAcceptPolicy = .always
         configuration.httpCookieStorage = HTTPCookieStorage.shared
         configuration.httpShouldSetCookies = true
-        session = URLSession(configuration: configuration, delegate: SecureRedirectDelegate(), delegateQueue: nil)
+        self.session = URLSession(configuration: configuration, delegate: SecureRedirectDelegate(), delegateQueue: nil)
     }
 
     func authProviders() async throws -> [[String: Any]] {
@@ -60,6 +64,12 @@ struct NativeAuthClient {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw AuthClientError.providerDiscoveryFailed("No response")
+        }
+        switch http.statusCode {
+        case 301, 302, 303, 307, 308:
+            return []
+        default:
+            break
         }
         guard (200...299).contains(http.statusCode) else {
             throw AuthClientError.providerDiscoveryFailed(parseError(data) ?? "HTTP \(http.statusCode)")
