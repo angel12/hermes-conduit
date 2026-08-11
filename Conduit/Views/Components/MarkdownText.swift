@@ -1279,7 +1279,11 @@ private enum MarkdownLanguage {
 private enum SyntaxHighlighter {
     static func highlight(_ source: String, language: String) -> AttributedString {
         let keywords: Set<String> = ["as", "async", "await", "break", "case", "catch", "class", "const", "continue", "def", "else", "enum", "false", "final", "for", "func", "guard", "if", "import", "in", "init", "let", "nil", "null", "private", "public", "return", "self", "static", "struct", "switch", "throw", "true", "try", "var", "while"]
-        let pattern = #"(//[^\n]*|#[^\n]*|/\*[\s\S]*?\*/|\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*'|\b\d+(?:\.\d+)?\b|\b[A-Za-z_][A-Za-z0-9_]*\b)"#
+        // String-literal alternatives must be disjoint (`\\.` vs `[^"\\]`):
+        // if both branches can match a backslash, an unterminated literal with
+        // many escapes — the normal transient state while a code block streams —
+        // backtracks exponentially and wedges the main thread (~2^k paths).
+        let pattern = #"(//[^\n]*|#[^\n]*|/\*[\s\S]*?\*/|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|\b\d+(?:\.\d+)?\b|\b[A-Za-z_][A-Za-z0-9_]*\b)"#
         guard let expression = try? NSRegularExpression(pattern: pattern) else { return AttributedString(source) }
         let range = NSRange(source.startIndex..., in: source)
         var cursor = source.startIndex

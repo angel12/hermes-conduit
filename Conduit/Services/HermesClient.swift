@@ -453,6 +453,10 @@ final class HermesClient: ObservableObject {
                 // Socket closed or errored
                 logger.error("WebSocket receive failed: \(error.localizedDescription, privacy: .public)")
                 isConnected = false
+                // No response can ever arrive on a dead socket; failing the
+                // in-flight requests here keeps awaiting UI from hanging for
+                // the remainder of each request's timeout.
+                failAllPendingRequests(with: HermesError.connectionClosed)
                 if !closedIntentionally {
                     onDisconnected?()
                 }
@@ -509,10 +513,13 @@ final class HermesClient: ObservableObject {
         session?.invalidateAndCancel()
         socketDelegate = nil
         isConnected = false
-        // Fail all pending requests
-        for (_, pending) in pending {
-            pending.timer?.invalidate()
-            pending.continuation.resume(throwing: HermesError.connectionClosed)
+        failAllPendingRequests(with: HermesError.connectionClosed)
+    }
+
+    private func failAllPendingRequests(with error: Error) {
+        for (_, request) in pending {
+            request.timer?.invalidate()
+            request.continuation.resume(throwing: error)
         }
         pending.removeAll()
     }
