@@ -128,6 +128,23 @@ enum DashboardTicketBridgeError: LocalizedError {
     }
 }
 
+/// WKUserContentController retains its script message handlers strongly, so
+/// registering the bridge directly forms a cycle (bridge → webView →
+/// configuration → userContentController → bridge) that `deinit` can never
+/// break — every replaced bridge would keep a WebKit content process alive
+/// for the app's lifetime. The proxy holds the bridge weakly instead.
+private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    private weak var delegate: WKScriptMessageHandler?
+
+    init(_ delegate: WKScriptMessageHandler) {
+        self.delegate = delegate
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        delegate?.userContentController(userContentController, didReceive: message)
+    }
+}
+
 @MainActor
 final class DashboardTicketBridge: NSObject {
     let baseURL: String
@@ -151,7 +168,7 @@ final class DashboardTicketBridge: NSObject {
         }
         self.webView = WKWebView(frame: .zero, configuration: configuration)
         super.init()
-        configuration.userContentController.add(self, name: "dashboard-response")
+        configuration.userContentController.add(WeakScriptMessageHandler(self), name: "dashboard-response")
         webView.navigationDelegate = self
         Task { [weak self] in
             guard let self else { return }
