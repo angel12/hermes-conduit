@@ -1665,6 +1665,13 @@ final class AppState: ObservableObject {
         showLogin = true
         sessions = []
         archivedSessions = []
+        cronSessions = []
+        // Sessions can be deleted from another client while signed out; a
+        // stale catalog cache would show those rows again after re-sign-in
+        // (and `loadedFullSessionHistory` would suppress the reload that
+        // could correct them).
+        profileSessionCache.removeAll()
+        loadedFullSessionHistory.removeAll()
         pinnedSessionIDs = []
         messages = []
         setActiveSessionState(id: nil, title: "New conversation")
@@ -3411,6 +3418,13 @@ final class AppState: ObservableObject {
     private func removeSessionFromLiveCatalog(_ session: SessionSummary) {
         sessions.removeAll { sessionMatches($0, session) }
         cronSessions.removeAll { sessionMatches($0, session) }
+        // Every non-forced catalog load merges the profile cache back into
+        // the published arrays and re-saves the union. A row left in the
+        // cache therefore resurrects a deleted or archived conversation on
+        // the next foreground or send, until a pull-to-refresh purges it.
+        for key in profileSessionCache.keys {
+            profileSessionCache[key]?.removeAll { sessionMatches($0, session) }
+        }
     }
 
     func clearActiveSessionIfNeeded(
