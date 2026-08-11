@@ -634,12 +634,23 @@ struct ChatView: View {
 
     private func updateBottomMarker(_ value: CGFloat?) {
         bottomMarkerMaxY = value
-        if isNearBottom && !hasPendingRestoration { followsLatest = true }
+        relatchFollowsLatestIfSettled()
     }
 
     private func updateViewportBottom(_ value: CGFloat?) {
         scrollViewportMaxY = value
-        if isNearBottom && !hasPendingRestoration { followsLatest = true }
+        relatchFollowsLatestIfSettled()
+    }
+
+    /// Geometry callbacks fire on every content-growth and scroll tick, so
+    /// they must not re-latch while the user's finger is still down: the drag
+    /// sets `followsLatest = false`, but until the finger travels past the
+    /// near-bottom window each streamed delta would yank the scroll back to
+    /// the bottom, fighting the drag.
+    private func relatchFollowsLatestIfSettled() {
+        if isNearBottom && !hasPendingRestoration && !isDraggingChat {
+            followsLatest = true
+        }
     }
 }
 
