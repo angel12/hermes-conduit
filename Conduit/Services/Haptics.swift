@@ -282,6 +282,14 @@ enum Haptics {
             playResponseStartFallback(token: token)
         }
     }
+    static func selectionChanged(_ changed: Bool) {
+        guard changed else { return }
+        selection()
+    }
+
+    static func mutationCompleted(_ succeeded: Bool) {
+        succeeded ? success() : error()
+    }
 
     static func responseConcluded() {
         guard emit(.responseConcluded) else { return }
