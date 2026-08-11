@@ -77,6 +77,10 @@ Select your team in Signing & Capabilities, then build and run on your device.
 - iOS 17 SDK
 - [xcodegen](https://github.com/yonaskolb/XcodeGen)
 
+## Releasing
+
+See [the iOS release workflow](docs/RELEASE_WORKFLOW.md) for the TestFlight and App Store release process.
+
 ## Architecture
 
 Conduit is pure SwiftUI targeting iOS 17+. The project uses xcodegen for Xcode project generation from `project.yml`.
