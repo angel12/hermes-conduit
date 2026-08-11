@@ -27,6 +27,11 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - name: Override event name for OpenCode compatibility
+        run: |
+          # OpenCode action doesn't support pull_request_target events.
+          # Rewrite GITHUB_EVENT_NAME so the action sees it as pull_request.
+          echo "GITHUB_EVENT_NAME=pull_request" >> "$GITHUB_ENV"
       - uses: anomalyco/opencode/github@latest
         env:
           OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
