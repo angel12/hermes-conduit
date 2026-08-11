@@ -24,9 +24,10 @@ jobs:
       - uses: anomalyco/opencode/github@latest
         env:
           OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.OPENCODE_GH_PAT }}
         with:
           model: go-custom/deepseek-v4-flash
-          token: ${{ secrets.OPENCODE_GH_PAT }}
+          use_github_token: true
           prompt: |
             You are a code reviewer. DO NOT modify any files. DO NOT make commits.
             DO NOT run builds or tests.
