@@ -171,6 +171,17 @@ private struct LegacySettingsView: View {
                     }
                     .padding(16)
                 }
+                Section {
+                    Button("Reset App Data", role: .destructive) {
+                        appState.disconnect()
+                        UserDefaults.standard.removePersistentDomain(forName: Bundle.main.bundleIdentifier!)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .center)
+                } header: {
+                    Text("Danger Zone")
+                } footer: {
+                    Text("Clears the stale session ID, auth ticket, and all cached data. Use this if Conduit gets stuck after a server DB reset.")
+                }
             }
             .toolbar(.hidden, for: .navigationBar)
             .safeAreaInset(edge: .top, spacing: 0) {
