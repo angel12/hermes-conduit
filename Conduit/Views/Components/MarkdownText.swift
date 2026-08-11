@@ -842,18 +842,35 @@ private struct WebFallbackImage: View {
     var body: some View {
         Group {
             if failed {
-                Link(destination: URL(string: url)!) {
-                    Label(alt.isEmpty ? "Open image" : "Image unavailable — open source", systemImage: "photo.badge.exclamationmark")
-                        .font(.footnote.weight(.semibold))
-                }
-                .tint(.conduitAccent)
-                .padding(12)
-                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                // A model-authored URL is not guaranteed to be RFC-valid
+                // (unencoded non-ASCII paths are common); force-unwrapping
+                // here crashed the app on exactly the images most likely to
+                // reach this fallback.
+                fallbackLabel
+                    .padding(12)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
             } else {
                 RemoteImageWebView(url: url, height: $height, failed: $failed)
                     .frame(height: min(max(height, 80), 420))
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
+        }
+    }
+
+    @ViewBuilder
+    private var fallbackLabel: some View {
+        let label = Label(
+            alt.isEmpty ? "Open image" : "Image unavailable — open source",
+            systemImage: "photo.badge.exclamationmark"
+        )
+        .font(.footnote.weight(.semibold))
+
+        if let destination = URL(string: url) ?? URL(string: url.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "") {
+            Link(destination: destination) { label }
+                .tint(.conduitAccent)
+        } else {
+            label
+                .foregroundStyle(.secondary)
         }
     }
 }
