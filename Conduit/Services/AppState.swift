@@ -2286,11 +2286,21 @@ final class AppState: ObservableObject {
                 return false
             }
 
-            let bufferedEvents = reconciliation?.token == token
+            var bufferedEvents = reconciliation?.token == token
                 ? (reconciliation?.bufferedEvents ?? []).filter {
                     reconciliation?.accepts(sessionID(for: $0)) == true
                 }
                 : []
+            if result.snapshot.hasLiveProjection {
+                // The live bubble was just seeded from the cumulative inflight
+                // projection, which already includes deltas emitted while this
+                // reconciliation was in flight. Replaying them verbatim repeats
+                // that text in the bubble.
+                bufferedEvents = Self.deduplicatingBufferedEvents(
+                    bufferedEvents,
+                    againstInflight: result.snapshot.inflightAssistantText
+                )
+            }
             bufferedEvents.forEach(applyStreamEvent)
             return settleReconciliationAndPublish(
                 token,
@@ -2641,6 +2651,61 @@ final class AppState: ObservableObject {
                 messages[index].approval = approval
             }
         }
+    }
+
+    /// Deltas buffered while reconciliation ran are usually already contained
+    /// in the resume snapshot's cumulative `inflight` projection — replaying
+    /// them on top of the seeded live bubble repeats that text. Collapse the
+    /// buffered deltas to the suffix the snapshot has not covered yet (their
+    /// concatenation overlaps the snapshot's tail), emitted as a single delta
+    /// in place of the last buffered one. Non-delta events pass through.
+    nonisolated static func deduplicatingBufferedEvents(
+        _ events: [StreamEvent],
+        againstInflight inflight: String
+    ) -> [StreamEvent] {
+        guard !inflight.isEmpty else { return events }
+        let deltaTexts: [String] = events.compactMap {
+            if case .messageDelta(_, let text) = $0 { return text }
+            return nil
+        }
+        guard !deltaTexts.isEmpty else { return events }
+
+        let combined = deltaTexts.joined()
+        let covered = overlapLength(betweenSuffixOf: inflight, andPrefixOf: combined)
+        let remainder = String(combined.dropFirst(covered))
+        guard remainder.count < combined.count else { return events }
+
+        let lastDeltaIndex = events.lastIndex {
+            if case .messageDelta = $0 { return true }
+            return false
+        }
+        var deduplicated: [StreamEvent] = []
+        for (index, event) in events.enumerated() {
+            guard case .messageDelta(let sessionId, _) = event else {
+                deduplicated.append(event)
+                continue
+            }
+            if index == lastDeltaIndex, !remainder.isEmpty {
+                deduplicated.append(.messageDelta(sessionId: sessionId, text: remainder))
+            }
+        }
+        return deduplicated
+    }
+
+    /// Longest `k` where the last `k` characters of `text` equal the first
+    /// `k` characters of `candidate`. The buffered stream is contiguous, so
+    /// the snapshot's tail and the buffer's head meet at exactly one offset.
+    nonisolated static func overlapLength(betweenSuffixOf text: String, andPrefixOf candidate: String) -> Int {
+        let textChars = Array(text)
+        let candidateChars = Array(candidate)
+        var k = min(textChars.count, candidateChars.count)
+        while k > 0 {
+            if textChars.suffix(k).elementsEqual(candidateChars.prefix(k)) {
+                return k
+            }
+            k -= 1
+        }
+        return 0
     }
 
     /// `session.resume.inflight` is a cumulative projection on some gateways.
