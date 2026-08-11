@@ -461,6 +461,8 @@ final class AppState: ObservableObject {
     private var hasScheduledStreamingPublish = false
     private var lastStreamingPublishBurst = 0
     private var lastStreamingPublishDate: Date?
+    private var responseHapticConclusionTask: Task<Void, Never>?
+    private var responseHaptics = ResponseHapticState()
     private var scenePhaseTask: Task<Void, Never>?
     private var scenePhaseAttemptID: UUID?
     private var explicitSessionOpenTask: Task<Bool, Never>?
@@ -805,6 +807,7 @@ final class AppState: ObservableObject {
     private func setActiveSessionState(id: String?, title: String? = nil) {
         if activeSessionId != id {
             clearPendingDecisionRestorationGuard()
+            resetResponseHapticTurn()
         }
         activeSessionId = id
         if let persistedID = ChatSessionPersistenceIdentity.canonicalID(
@@ -2965,6 +2968,15 @@ final class AppState: ObservableObject {
 
     @discardableResult
     func handleScenePhase(_ phase: ScenePhase) -> Task<Void, Never>? {
+        if phase != .active {
+            responseHapticConclusionTask?.cancel()
+            responseHapticConclusionTask = nil
+        }
+        if let effect = responseHaptics.setForegroundActive(
+            ResponseHapticPolicy.treatsAsForegroundActive(phase)
+        ) {
+            performResponseHapticEffects([effect])
+        }
         switch phase {
         case .active:
             voiceConversationController.setForegroundActive(true)
@@ -3745,6 +3757,7 @@ final class AppState: ObservableObject {
     func sendMessage(_ text: String, attachments: [Attachment] = []) async -> Bool {
         guard let client, let sessionId = activeSessionId else { return false }
         cancelChatResumeRestoration()
+        resetResponseHapticTurn()
 
         let userMessage = ChatMessage(
             id: "local-\(Date().timeIntervalSince1970)",
@@ -5707,6 +5720,9 @@ final class AppState: ObservableObject {
         let streamSessionId = sessionID(for: event)
         guard eventBelongsToActiveSession(streamSessionId) else { return }
         defer { schedulePresentationCacheFlush(for: streamSessionId) }
+        if let signal = ResponseHapticPolicy.signal(for: event) {
+            applyResponseHapticSignal(signal)
+        }
 
         switch event {
         case .messageStart:
@@ -5753,6 +5769,13 @@ final class AppState: ObservableObject {
 
         case .sessionBusy(_, let busy):
             setRunning(busy)
+            if ResponseHapticPolicy.shouldScheduleIdleConclusion(
+                isBusy: busy,
+                hasPendingConclusion: responseHaptics.pendingConclusion != nil,
+                awaitsUserInput: responseAwaitsUserInput
+            ) {
+                scheduleResponseHapticConclusion(after: 180)
+            }
 
         case .sessionInfo(_, let snapshot):
             applyRuntime(snapshot)
@@ -6134,6 +6157,97 @@ final class AppState: ObservableObject {
         turnState = running ? .running : .idle
     }
 
+    private func applyResponseHapticSignal(_ signal: ResponseHapticPolicy.Signal) {
+        switch signal {
+        case .activity(let playsStart):
+            registerResponseActivity(playsStart: playsStart)
+        case .tool:
+            registerToolHaptic()
+        case .failure:
+            failResponseHapticTurn()
+        case .reset:
+            resetResponseHapticTurn()
+        }
+    }
+
+    private func registerResponseActivity(playsStart: Bool) {
+        cancelPendingResponseHapticConclusion()
+        performResponseHapticEffects(
+            responseHaptics.registerActivity(playsStart: playsStart)
+        )
+    }
+
+    private func registerToolHaptic() {
+        cancelPendingResponseHapticConclusion()
+        performResponseHapticEffects(responseHaptics.registerTool(at: Date()))
+    }
+
+    private var responseAwaitsUserInput: Bool {
+        messages.contains { message in
+            message.clarify.map { $0.status == .pending || $0.status == .submitting } == true
+                || message.approval.map { $0.status == .pending || $0.status == .submitting } == true
+        }
+    }
+
+    private func scheduleResponseHapticConclusion(after delayMilliseconds: Int) {
+        cancelPendingResponseHapticConclusion()
+        guard let conclusion = responseHaptics.scheduleConclusion(
+            sessionID: activeSessionId
+        ) else { return }
+        responseHapticConclusionTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(delayMilliseconds))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  let self,
+                  self.activeSessionId == conclusion.sessionID,
+                  let effect = self.responseHaptics.finishConclusion(conclusion) else {
+                return
+            }
+            self.responseHapticConclusionTask = nil
+            self.performResponseHapticEffects([effect])
+        }
+    }
+
+    private func failResponseHapticTurn() {
+        responseHapticConclusionTask?.cancel()
+        responseHapticConclusionTask = nil
+        performResponseHapticEffects(responseHaptics.fail())
+    }
+
+    private func resetResponseHapticTurn() {
+        responseHapticConclusionTask?.cancel()
+        responseHapticConclusionTask = nil
+        performResponseHapticEffects(responseHaptics.reset())
+    }
+
+    private func cancelPendingResponseHapticConclusion() {
+        responseHapticConclusionTask?.cancel()
+        responseHapticConclusionTask = nil
+        responseHaptics.invalidateConclusion()
+    }
+
+    private func performResponseHapticEffects(
+        _ effects: [ResponseHapticState.Effect]
+    ) {
+        for effect in effects {
+            switch effect {
+            case .responseStarted:
+                Haptics.responseStarted()
+            case .toolStarted:
+                Haptics.toolStarted()
+            case .responseConcluded:
+                Haptics.responseConcluded()
+            case .error:
+                Haptics.error()
+            case .cancelPattern:
+                Haptics.cancelLifecyclePattern()
+            }
+        }
+    }
+
     /// Voice uses the same submission and active-turn interruption policy as
     /// the composer. Keeping this seam here prevents audio UI from inferring
     /// request state from transcript timing.
@@ -6465,6 +6579,7 @@ final class AppState: ObservableObject {
             1_200,
             max(180, Int((Double(charactersToDrain) / 540.0) * 1_000) + 180)
         )
+        scheduleResponseHapticConclusion(after: drainMilliseconds)
 
         streamingCompletionTask = Task { @MainActor [weak self] in
             do {
@@ -6475,12 +6590,17 @@ final class AppState: ObservableObject {
             guard !Task.isCancelled,
                   let self,
                   self.activeSessionId == sessionId else { return }
-            self.finalizePendingStreamingCompletion()
+            self.finalizePendingStreamingCompletion(cancelResponseHapticConclusion: false)
         }
     }
 
-    private func finalizePendingStreamingCompletion() {
+    private func finalizePendingStreamingCompletion(
+        cancelResponseHapticConclusion: Bool = true
+    ) {
         guard let pendingStreamingCompletion else { return }
+        if cancelResponseHapticConclusion {
+            cancelPendingResponseHapticConclusion()
+        }
         streamingCompletionTask?.cancel()
         streamingCompletionTask = nil
         self.pendingStreamingCompletion = nil
