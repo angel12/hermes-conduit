@@ -498,6 +498,20 @@ final class AppState: ObservableObject {
     /// Coalesces presentation-cache flushes during streaming so we
     /// don't serialize and write UserDefaults on every WebSocket frame.
     private var presentationCacheFlushTask: Task<Void, Never>?
+    /// A nil resume can restore a decision card from local presentation data.
+    /// Keep the card in memory for this AppState so another foreground resume
+    /// can still show it, but strip it from cache writes until Hermes confirms
+    /// the turn. Scope the guard to the session/profile that produced it so a
+    /// session switch cannot affect another session's presentation.
+    private struct PendingDecisionRestorationGuard {
+        let profile: String
+        let sessionID: String
+        let pendingDecisionKeys: Set<String>
+        let restoredAt: Date
+        let messages: [ChatMessage]
+    }
+
+    private var restoredPendingDecisionCardsAwaitingConfirmation: PendingDecisionRestorationGuard?
     /// Timestamp of the last successful coalesced cache flush; used to
     /// enforce a maximum 5-second interval even during continuous streaming.
     private var lastPresentationCacheFlushDate: Date?
@@ -512,7 +526,7 @@ final class AppState: ObservableObject {
     private var profileSessionCache: [String: [SessionSummary]] = [:]
     private var projectsRequestGeneration = 0
     private var loadedFullSessionHistory = Set<String>()
-    private let sessionPresentationCache = SessionPresentationCache.shared
+    private let sessionPresentationCache: SessionPresentationCache
 
     /// The dashboard's persisted transcript is richer than `session.resume`:
     /// it retains database timestamps, complete tool-call inputs, and other
@@ -540,7 +554,29 @@ final class AppState: ObservableObject {
             reconciliation?.requestedSessionId,
             reconciliation?.resolvedSessionId
         ].compactMap { $0 }
-        sessionPresentationCache.save(messages, profile: activeProfile, sessionIDs: ids)
+        let restorationKeys: Set<String>? = {
+            guard let restorationGuard = restoredPendingDecisionCardsAwaitingConfirmation,
+                  restorationGuard.profile == activeProfile,
+                  activeSessionId == restorationGuard.sessionID else {
+                return nil
+            }
+            return restorationGuard.pendingDecisionKeys
+        }()
+        let cacheableMessages = restorationKeys.map {
+            SessionPresentationCache.removingPendingDecisionPresentation(
+                from: messages,
+                matching: $0
+            )
+        } ?? messages
+        let preservePendingDecisionCards = restorationKeys == nil
+            || !SessionPresentationCache.pendingDecisionKeys(in: cacheableMessages).isEmpty
+        sessionPresentationCache.save(
+            cacheableMessages,
+            profile: activeProfile,
+            sessionIDs: ids,
+            preservePendingDecisionCards: preservePendingDecisionCards,
+            unconfirmedPendingDecisionKeys: restorationKeys ?? []
+        )
     }
 
     /// Coalesces presentation-cache writes during streaming. Instead of
@@ -650,9 +686,11 @@ final class AppState: ObservableObject {
         sessionCatalogLoader: ((Bool) async throws -> [SessionSummary])? = nil,
         reconnectScheduler: ChatResumeReconnectScheduler? = nil,
         reconnectExecutor: ChatResumeReconnectExecutor? = nil,
-        chatResumeLifecycleOperations: ChatResumeLifecycleOperations = .live
+        chatResumeLifecycleOperations: ChatResumeLifecycleOperations = .live,
+        sessionPresentationCache: SessionPresentationCache = .shared
     ) {
         self.defaults = defaults
+        self.sessionPresentationCache = sessionPresentationCache
         self.chatResumeCoordinator = chatResumeCoordinator
             ?? ChatResumeCoordinator(store: ChatResumeStore(defaults: defaults))
         self.recoverySequence = recoverySequence
@@ -697,6 +735,7 @@ final class AppState: ObservableObject {
     }
 
     func restoreActiveSessionState(for profile: String) {
+        clearPendingDecisionRestorationGuard()
         activeSessionId = chatResumeCoordinator.lastSessionID(for: profile)
         activeSessionTitle = activeSessionTitlesByProfile[profile] ?? "New conversation"
     }
@@ -743,7 +782,29 @@ final class AppState: ObservableObject {
         persistPinnedSessions()
     }
 
+    private func pendingDecisionRestorationMessages(for sessionID: String) -> [ChatMessage] {
+        guard let restorationGuard = restoredPendingDecisionCardsAwaitingConfirmation,
+              restorationGuard.profile == activeProfile,
+              restorationGuard.sessionID == sessionID else {
+            return []
+        }
+        guard !sessionPresentationCache.isUnconfirmedPendingDecisionExpired(
+            since: restorationGuard.restoredAt
+        ) else {
+            clearPendingDecisionRestorationGuard()
+            return []
+        }
+        return restorationGuard.messages
+    }
+
+    private func clearPendingDecisionRestorationGuard() {
+        restoredPendingDecisionCardsAwaitingConfirmation = nil
+    }
+
     private func setActiveSessionState(id: String?, title: String? = nil) {
+        if activeSessionId != id {
+            clearPendingDecisionRestorationGuard()
+        }
         activeSessionId = id
         if let persistedID = ChatSessionPersistenceIdentity.canonicalID(
             for: id,
@@ -1175,6 +1236,7 @@ final class AppState: ObservableObject {
         supportsProjects = false
         projectsLoading = false
         profiles = []
+        clearPendingDecisionRestorationGuard()
         activeSessionId = nil
         activeSessionTitle = "New conversation"
         messages = []
@@ -2389,22 +2451,94 @@ final class AppState: ObservableObject {
             automaticWorkToken,
             syncOperationID: automaticSyncOperationID
         ) else { return false }
+        let retainedRestoredMessages = pendingDecisionRestorationMessages(for: result.sessionId)
         markChatViewportReplacement()
         setActiveSessionState(id: result.sessionId, title: "New conversation")
         updateActiveSessionTitle(
             for: result.sessionId,
             fallbackSessionId: reconciliation?.requestedSessionId
         )
+        // Hermes can omit `running` on versions that still support paused
+        // clarify/approval turns. Only an explicit false means the turn is
+        // settled, so nil remains eligible for restoring locally observed
+        // pending decision cards.
+        let restorePendingCards = Self.shouldRestorePendingCards(running: result.snapshot.running)
+        let sessionIDs = [result.sessionId, reconciliation?.requestedSessionId].compactMap { $0 }
+        let gatewayDecisionKeys = Set(result.messages.compactMap(SessionPresentationCache.decisionKey(for:)))
+        let retainedMessages = restorePendingCards
+            ? retainedRestoredMessages.filter {
+                guard let key = SessionPresentationCache.decisionKey(for: $0) else { return false }
+                return !gatewayDecisionKeys.contains(key)
+            }
+            : []
         let restored = sessionPresentationCache.merge(
-            result.messages,
+            result.messages + retainedMessages,
             profile: activeProfile,
-            sessionIDs: [result.sessionId, reconciliation?.requestedSessionId].compactMap { $0 },
-            includePendingClarifications: result.snapshot.running == true,
-            includePendingApprovals: result.snapshot.running == true
+            sessionIDs: sessionIDs,
+            includePendingClarifications: restorePendingCards,
+            includePendingApprovals: restorePendingCards
         )
         messages = mergeCachedReviews(into: restored, sessionId: result.sessionId)
         noteChatViewportTranscriptReplacement()
-        cacheMessagePresentation(for: [result.sessionId])
+        let gatewayPendingDecisionKeys = SessionPresentationCache.pendingDecisionKeys(in: result.messages)
+        if result.snapshot.running == false && !gatewayPendingDecisionKeys.isEmpty {
+            messages = SessionPresentationCache.removingPendingDecisionPresentation(
+                from: messages,
+                matching: gatewayPendingDecisionKeys
+            )
+        }
+        let restoredPendingDecisionKeys = SessionPresentationCache
+            .pendingDecisionKeys(in: messages)
+            .subtracting(gatewayPendingDecisionKeys)
+        let gatewaySentPendingDecision = !gatewayPendingDecisionKeys.isEmpty
+        var restoredMessagesAwaitingConfirmation: [ChatMessage] = []
+        if result.snapshot.running != true && !restoredPendingDecisionKeys.isEmpty {
+            Self.resetSubmittingRestoredDecisions(
+                in: &messages,
+                matching: restoredPendingDecisionKeys
+            )
+            restoredMessagesAwaitingConfirmation = messages.filter {
+                guard let key = SessionPresentationCache.decisionKey(for: $0),
+                      restoredPendingDecisionKeys.contains(key) else {
+                    return false
+                }
+                return SessionPresentationCache.pendingDecisionKey(for: $0) != nil
+            }
+        } else {
+            clearPendingDecisionRestorationGuard()
+        }
+        let hasPendingDecision = Self.hasPendingDecision(in: messages)
+        // Persist the gateway transcript on every resume so fresh rows are not
+        // lost. A locally restored card remains in the active AppState for the
+        // next foreground cycle and is persisted with a bounded unconfirmed
+        // marker until Hermes confirms the turn or the user interacts with it.
+        let gatewayConfirmsActiveTurn = result.snapshot.running == true
+            || (result.snapshot.running != false && gatewaySentPendingDecision)
+        let unconfirmedPendingDecisionKeys = result.snapshot.running != true
+            ? restoredPendingDecisionKeys
+            : []
+        let shouldPersistMergedPresentation = gatewayConfirmsActiveTurn
+            || !unconfirmedPendingDecisionKeys.isEmpty
+        sessionPresentationCache.save(
+            shouldPersistMergedPresentation ? messages : result.messages,
+            profile: activeProfile,
+            sessionIDs: sessionIDs,
+            preservePendingDecisionCards: gatewayConfirmsActiveTurn || !unconfirmedPendingDecisionKeys.isEmpty,
+            unconfirmedPendingDecisionKeys: unconfirmedPendingDecisionKeys
+        )
+        if result.snapshot.running != true && !restoredPendingDecisionKeys.isEmpty {
+            let restoredAt = sessionPresentationCache.unconfirmedPendingDecisionDate(
+                profile: activeProfile,
+                sessionIDs: sessionIDs
+            ) ?? Date()
+            restoredPendingDecisionCardsAwaitingConfirmation = PendingDecisionRestorationGuard(
+                profile: activeProfile,
+                sessionID: result.sessionId,
+                pendingDecisionKeys: restoredPendingDecisionKeys,
+                restoredAt: restoredAt,
+                messages: restoredMessagesAwaitingConfirmation
+            )
+        }
         scheduleSecondaryProfileTitleRecovery(
             sessionId: result.sessionId,
             messages: messages
@@ -2423,14 +2557,60 @@ final class AppState: ObservableObject {
         receivedReasoningForCurrentTurn = false
         applyRuntime(result.snapshot)
 
-        if TurnState.fromGatewayRunning(result.snapshot.running) == .unsupportedGateway {
+        // A paused clarification or approval can have neither a live text
+        // projection nor an explicit `running` field. The restored card is
+        // actionable evidence for this UI, so keep the composer enabled for
+        // it instead of treating the gateway as unsupported.
+        if result.snapshot.running == nil && (result.snapshot.hasLiveProjection || hasPendingDecision) {
+            turnState = .running
+        } else if TurnState.fromGatewayRunning(result.snapshot.running) == .unsupportedGateway {
             turnState = .unsupportedGateway
             errorMessage = "This Hermes gateway must support session turn state. Update Hermes to enable message, stop, and steer controls."
             return true
+        } else {
+            turnState = TurnState.fromGatewayRunning(result.snapshot.running)
         }
-
-        turnState = TurnState.fromGatewayRunning(result.snapshot.running)
         return true
+    }
+
+    /// Testable helper: derives whether pending clarify/approval cards should
+    /// be restored from the presentation cache on resume. An explicit false
+    /// is the only settled-turn signal; nil is still eligible because older
+    /// Hermes gateways omit `running` for paused decision turns.
+    static func shouldRestorePendingCards(running: Bool?) -> Bool {
+        running != false
+    }
+
+    static func hasPendingDecision(in messages: [ChatMessage]) -> Bool {
+        messages.contains { message in
+            let clarifyPending = message.clarify?.status == .pending || message.clarify?.status == .submitting
+            let approvalPending = message.approval?.status == .pending || message.approval?.status == .submitting
+            return clarifyPending || approvalPending
+        }
+    }
+
+    private static func resetSubmittingRestoredDecisions(
+        in messages: inout [ChatMessage],
+        matching keys: Set<String>
+    ) {
+        for index in messages.indices {
+            if var clarify = messages[index].clarify,
+               clarify.status == .submitting,
+               keys.contains("clarify:\(clarify.requestId)") {
+                clarify.status = .pending
+                clarify.answer = nil
+                clarify.error = nil
+                messages[index].clarify = clarify
+            }
+            if var approval = messages[index].approval,
+               approval.status == .submitting,
+               keys.contains("approval:\(approval.sessionId)") {
+                approval.status = .pending
+                approval.choice = nil
+                approval.error = nil
+                messages[index].approval = approval
+            }
+        }
     }
 
     /// `session.resume.inflight` is a cumulative projection on some gateways.
@@ -4448,6 +4628,7 @@ final class AppState: ObservableObject {
             markChatViewportReplacement()
             connection = freshConnection
             client = nextClient
+            clearPendingDecisionRestorationGuard()
             activeProfile = target
             sessions = []
             cronSessions = []
@@ -4496,6 +4677,7 @@ final class AppState: ObservableObject {
                 return false
             }
             errorMessage = "Could not switch workspace: \(error.localizedDescription)"
+            clearPendingDecisionRestorationGuard()
             activeProfile = previousProfile
             sessions = previousSessions
             cronSessions = previousCronSessions
@@ -5919,6 +6101,9 @@ final class AppState: ObservableObject {
 
     private func setRunning(_ running: Bool) {
         guard turnState != .unsupportedGateway else { return }
+        if running {
+            clearPendingDecisionRestorationGuard()
+        }
         turnState = running ? .running : .idle
     }
 

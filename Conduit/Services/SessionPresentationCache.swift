@@ -13,8 +13,70 @@ import Foundation
 
 final class SessionPresentationCache {
     static let shared = SessionPresentationCache()
+    static let maxUnconfirmedPendingDecisionAge: TimeInterval = 24 * 60 * 60
 
-    private struct CachedMessage: Codable {
+    /// Returns whether a clarification or approval presentation still needs a
+    /// user decision. Keep this rule shared by resume pruning and cache saves.
+    static func isPendingDecision(_ status: ClarifyActivity.Status) -> Bool {
+        status == .pending || status == .submitting
+    }
+
+    static func isPendingDecision(_ status: ApprovalActivity.Status) -> Bool {
+        status == .pending || status == .submitting
+    }
+
+    /// Stable identity for a decision card, regardless of whether it is still
+    /// pending. This lets resume reconciliation recognize a resolved gateway
+    /// row and suppress a matching locally cached card.
+    static func decisionKey(for message: ChatMessage) -> String? {
+        if let clarify = message.clarify {
+            return "clarify:\(clarify.requestId)"
+        }
+        if let approval = message.approval {
+            return "approval:\(approval.sessionId)"
+        }
+        return nil
+    }
+
+    static func pendingDecisionKey(for message: ChatMessage) -> String? {
+        if let clarify = message.clarify, isPendingDecision(clarify.status) {
+            return "clarify:\(clarify.requestId)"
+        }
+        if let approval = message.approval, isPendingDecision(approval.status) {
+            return "approval:\(approval.sessionId)"
+        }
+        return nil
+    }
+
+    static func pendingDecisionKeys(in messages: [ChatMessage]) -> Set<String> {
+        Set(messages.compactMap(pendingDecisionKey(for:)))
+    }
+
+    /// Removes only the selected pending decision presentations. Completed
+    /// decision metadata and unrelated pending cards remain untouched.
+    static func removingPendingDecisionPresentation(
+        from messages: [ChatMessage],
+        matching keys: Set<String>
+    ) -> [ChatMessage] {
+        messages.compactMap { original in
+            var message = original
+            if let clarify = message.clarify,
+               isPendingDecision(clarify.status),
+               keys.contains("clarify:\(clarify.requestId)") {
+                message.clarify = nil
+            }
+            if let approval = message.approval,
+               isPendingDecision(approval.status),
+               keys.contains("approval:\(approval.sessionId)") {
+                message.approval = nil
+            }
+            if message.role == .clarify, message.clarify == nil { return nil }
+            if message.role == .approval, message.approval == nil { return nil }
+            return message
+        }
+    }
+
+    private struct CachedMessage: Codable, Equatable {
         var id: String
         var role: MessageRole
         var signature: String
@@ -54,14 +116,37 @@ final class SessionPresentationCache {
     private struct CachedSession: Codable {
         var updatedAt: Date
         var messages: [CachedMessage]
+        var unconfirmedPendingDecisionAt: Date?
     }
 
-    private let defaults = UserDefaults.standard
+    /// An omitted running state is inherently ambiguous. Keep an unconfirmed
+    /// decision across a cold launch for a bounded grace period, then prefer a
+    /// stale-card miss over making an old request answerable forever.
+    private let defaults: UserDefaults
+    private let now: () -> Date
     private let storageKey = "conduit.sessionPresentation.v1"
     private let maxSessions = 32
     private let maxMessagesPerSession = 320
 
-    private init() {}
+    init(defaults: UserDefaults = .standard, now: @escaping () -> Date = { Date() }) {
+        self.defaults = defaults
+        self.now = now
+    }
+
+    func unconfirmedPendingDecisionDate(
+        profile: String,
+        sessionIDs: [String]
+    ) -> Date? {
+        let stored = load()
+        return sessionIDs
+            .compactMap { stored[key(profile: profile, sessionID: $0)]?.unconfirmedPendingDecisionAt }
+            .min()
+    }
+
+    func isUnconfirmedPendingDecisionExpired(since date: Date?) -> Bool {
+        guard let date else { return false }
+        return now().timeIntervalSince(date) > Self.maxUnconfirmedPendingDecisionAge
+    }
 
     /// Restores only fields Hermes did not send in its persisted history.
     /// The transcript, message ordering, and any nonempty server value always
@@ -73,9 +158,17 @@ final class SessionPresentationCache {
         includePendingClarifications: Bool = false,
         includePendingApprovals: Bool = false
     ) -> [ChatMessage] {
+        let stored = load()
         let cached = sessionIDs
-            .compactMap { load()[key(profile: profile, sessionID: $0)]?.messages }
-            .flatMap { $0 }
+            .compactMap { stored[key(profile: profile, sessionID: $0)] }
+            .flatMap { session in
+                let unconfirmedExpired = isUnconfirmedPendingDecisionExpired(
+                    since: session.unconfirmedPendingDecisionAt
+                )
+                return unconfirmedExpired
+                    ? removingPendingDecisionPresentation(from: session.messages)
+                    : session.messages
+            }
         guard !cached.isEmpty else { return messages }
 
         var remaining = Set(cached.indices)
@@ -116,11 +209,15 @@ final class SessionPresentationCache {
                 message.attachments = cachedAttachments
             }
 
-            if message.clarify == nil, let cachedClarify = presentation.clarify {
+            if message.clarify == nil,
+               let cachedClarify = presentation.clarify,
+               !Self.isPendingDecision(cachedClarify.status) || includePendingClarifications {
                 message.clarify = cachedClarify
             }
 
-            if message.approval == nil, let cachedApproval = presentation.approval {
+            if message.approval == nil,
+               let cachedApproval = presentation.approval,
+               !Self.isPendingDecision(cachedApproval.status) || includePendingApprovals {
                 message.approval = cachedApproval
             }
 
@@ -129,7 +226,7 @@ final class SessionPresentationCache {
 
         if includePendingClarifications {
             let pendingClarifications = cached.compactMap(\.clarify).filter {
-                $0.status == .pending || $0.status == .submitting
+                Self.isPendingDecision($0.status)
             }
 
             // A gateway resume can retain the running clarify tool call but omit
@@ -157,11 +254,10 @@ final class SessionPresentationCache {
 
         if includePendingApprovals {
             let pendingApprovals = cached.compactMap(\.approval).filter {
-                $0.status == .pending || $0.status == .submitting
+                Self.isPendingDecision($0.status)
             }
             for approval in pendingApprovals where !merged.contains(where: {
                 $0.approval?.sessionId == approval.sessionId
-                    && ($0.approval?.status == .pending || $0.approval?.status == .submitting)
             }) {
                 let cachedMessage = cached.last { $0.approval?.sessionId == approval.sessionId }
                 merged.append(ChatMessage(
@@ -176,23 +272,142 @@ final class SessionPresentationCache {
         return merged
     }
 
-    func save(_ messages: [ChatMessage], profile: String, sessionIDs: [String]) {
+    func save(
+        _ messages: [ChatMessage],
+        profile: String,
+        sessionIDs: [String],
+        preservePendingDecisionCards: Bool = true,
+        unconfirmedPendingDecisionKeys: Set<String> = []
+    ) {
         let ids = Set(sessionIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
         guard !ids.isEmpty else { return }
 
         var store = load()
         let freshRecords = messages.suffix(maxMessagesPerSession).map { CachedMessage($0) }
-        guard !freshRecords.isEmpty else { return }
+        guard !freshRecords.isEmpty else {
+            guard !preservePendingDecisionCards || !unconfirmedPendingDecisionKeys.isEmpty else { return }
+            var changed = false
+            for id in ids {
+                let cacheKey = key(profile: profile, sessionID: id)
+                guard var session = store[cacheKey] else { continue }
+                let pruned = removingPendingDecisionPresentation(
+                    from: session.messages,
+                    preserving: unconfirmedPendingDecisionKeys
+                )
+                let unconfirmedAt = unconfirmedPendingDecisionKeys.isEmpty
+                    ? nil
+                    : (session.unconfirmedPendingDecisionAt ?? now())
+                guard pruned != session.messages || unconfirmedAt != session.unconfirmedPendingDecisionAt else {
+                    continue
+                }
+                session.messages = pruned
+                session.unconfirmedPendingDecisionAt = unconfirmedAt
+                store[cacheKey] = session
+                changed = true
+            }
+            if changed { persist(store) }
+            return
+        }
         let existingRecords = ids.lazy
             .compactMap { store[self.key(profile: profile, sessionID: $0)]?.messages }
             .first ?? []
-        let records = preservingPresentation(in: freshRecords, from: existingRecords)
-        let session = CachedSession(updatedAt: Date(), messages: records)
+        var records = preservingPresentation(
+            in: freshRecords,
+            from: existingRecords,
+            preservePendingDecisionCards: preservePendingDecisionCards
+        )
+        appendUnconfirmedPendingDecisionRecords(
+            to: &records,
+            from: existingRecords,
+            matching: unconfirmedPendingDecisionKeys
+        )
+        if !preservePendingDecisionCards {
+            records = removingPendingDecisionPresentation(
+                from: records,
+                preserving: unconfirmedPendingDecisionKeys
+            )
+        }
+        let existingUnconfirmedAt = ids.lazy
+            .compactMap { store[self.key(profile: profile, sessionID: $0)]?.unconfirmedPendingDecisionAt }
+            .first
+        let unconfirmedAt = unconfirmedPendingDecisionKeys.isEmpty
+            ? nil
+            : (existingUnconfirmedAt ?? now())
+        let session = CachedSession(
+            updatedAt: now(),
+            messages: records,
+            unconfirmedPendingDecisionAt: unconfirmedAt
+        )
         for id in ids {
             store[key(profile: profile, sessionID: id)] = session
         }
         trim(&store)
         persist(store)
+    }
+
+    /// A resume without an explicit active-turn signal may temporarily show a
+    /// locally restored decision card, but that card is not authoritative
+    /// enough to keep writing to disk. Strip only pending/submitting decision
+    /// presentation while preserving normal transcript metadata.
+    private func removingPendingDecisionPresentation(
+        from messages: [CachedMessage],
+        preserving keys: Set<String> = []
+    ) -> [CachedMessage] {
+        messages.compactMap { original in
+            var message = original
+            if let clarify = message.clarify,
+               Self.isPendingDecision(clarify.status),
+               !keys.contains("clarify:\(clarify.requestId)") {
+                message.clarify = nil
+            }
+            if let approval = message.approval,
+               Self.isPendingDecision(approval.status),
+               !keys.contains("approval:\(approval.sessionId)") {
+                message.approval = nil
+            }
+            if message.role == .clarify, message.clarify == nil { return nil }
+            if message.role == .approval, message.approval == nil { return nil }
+            return message
+        }
+    }
+
+    private func decisionKey(for message: CachedMessage) -> String? {
+        if let clarify = message.clarify {
+            return "clarify:\(clarify.requestId)"
+        }
+        if let approval = message.approval {
+            return "approval:\(approval.sessionId)"
+        }
+        return nil
+    }
+
+    private func pendingDecisionKey(for message: CachedMessage) -> String? {
+        if let clarify = message.clarify, Self.isPendingDecision(clarify.status) {
+            return "clarify:\(clarify.requestId)"
+        }
+        if let approval = message.approval, Self.isPendingDecision(approval.status) {
+            return "approval:\(approval.sessionId)"
+        }
+        return nil
+    }
+
+    private func appendUnconfirmedPendingDecisionRecords(
+        to records: inout [CachedMessage],
+        from existing: [CachedMessage],
+        matching keys: Set<String>
+    ) {
+        guard !keys.isEmpty else { return }
+        var existingRecordKeys = Set(records.compactMap(decisionKey(for:)))
+        for record in existing {
+            guard let pendingKey = pendingDecisionKey(for: record),
+                  keys.contains(pendingKey),
+                  let recordKey = decisionKey(for: record),
+                  !existingRecordKeys.contains(recordKey) else {
+                continue
+            }
+            records.append(record)
+            existingRecordKeys.insert(recordKey)
+        }
     }
 
     func clear(profile: String? = nil) {
@@ -279,7 +494,8 @@ final class SessionPresentationCache {
     /// used when Hermes has re-rendered the response text.
     private func preservingPresentation(
         in fresh: [CachedMessage],
-        from existing: [CachedMessage]
+        from existing: [CachedMessage],
+        preservePendingDecisionCards: Bool
     ) -> [CachedMessage] {
         fresh.enumerated().map { position, record in
             var merged = record
@@ -305,6 +521,16 @@ final class SessionPresentationCache {
             }
             if merged.attachments?.isEmpty != false {
                 merged.attachments = prior.attachments
+            }
+            if merged.clarify == nil,
+               let priorClarify = prior.clarify,
+               !Self.isPendingDecision(priorClarify.status) || preservePendingDecisionCards {
+                merged.clarify = prior.clarify
+            }
+            if merged.approval == nil,
+               let priorApproval = prior.approval,
+               !Self.isPendingDecision(priorApproval.status) || preservePendingDecisionCards {
+                merged.approval = prior.approval
             }
             return merged
         }
