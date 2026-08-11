@@ -43,6 +43,7 @@ jobs:
         env:
           OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.OPENCODE_GH_PAT }}
+          GITHUB_EVENT_NAME: pull_request
         with:
           model: go-custom/deepseek-v4-flash
           use_github_token: true
