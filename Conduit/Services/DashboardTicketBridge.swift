@@ -81,7 +81,31 @@ enum DashboardCookiePersistence {
         KeychainHelper.saveDashboardCookies(data)
     }
 
-    private static func cookieMatchesHost(_ cookie: HTTPCookie, host: String) -> Bool {
+    /// Removes dashboard-origin cookies from a WebKit cookie store. Disconnect
+    /// must not leave a reusable HttpOnly session behind in the persistent
+    /// default data store; clearing only the origin-matching cookies keeps any
+    /// unrelated cookies intact.
+    static func clear(from cookieStore: WKHTTPCookieStore, for url: URL?) async {
+        guard let host = url?.host?.lowercased() else { return }
+        for cookie in await cookieStore.allCookies() where cookieMatchesHost(cookie, host: host) {
+            await cookieStore.deleteCookie(cookie)
+        }
+    }
+
+    /// Removes dashboard-origin cookies from the shared Foundation cookie
+    /// store. The native password-login flow authenticates through
+    /// `HTTPCookieStorage.shared`; without this, its session cookie outlives
+    /// Disconnect and can satisfy a later silent resume. `HTTPCookieStorage`
+    /// is thread-safe, so this is `nonisolated` to stay callable from any
+    /// context (including tests) without requiring main-actor isolation.
+    nonisolated static func clearNativeCookies(for baseURL: String) {
+        guard let host = URL(string: baseURL)?.host?.lowercased() else { return }
+        for cookie in HTTPCookieStorage.shared.cookies ?? [] where cookieMatchesHost(cookie, host: host) {
+            HTTPCookieStorage.shared.deleteCookie(cookie)
+        }
+    }
+
+    nonisolated private static func cookieMatchesHost(_ cookie: HTTPCookie, host: String) -> Bool {
         let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
         return host == domain || host.hasSuffix(".\(domain)")
     }
