@@ -27,6 +27,8 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - name: Clone upstream Hermes for protocol reference
+        run: git clone --depth 1 https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent
       - name: Install opencode
         run: |
           if [ ! -d "$HOME/.opencode/bin" ]; then
@@ -34,7 +36,7 @@ jobs:
           fi
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
       - name: Run opencode review
-        run: GITHUB_EVENT_NAME=pull_request opencode github run
+        run: GITHUB_EVENT_NAME=pull_request GITHUB_ACTOR=${{ github.repository_owner }} opencode github run
         env:
           OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.OPENCODE_GH_PAT }}
@@ -66,6 +68,10 @@ jobs:
             - SwiftUI lifecycle bugs (onAppear side effects, state management, body re-renders)
             - Accessibility (missing labels, traits, dynamic type support)
             - Memory leaks and resource cleanup
+            - Protocol boundary correctness: if this PR touches session handling, RPC,
+              streaming, or WebSocket communication, consult the upstream Hermes gateway
+              source at /tmp/hermes-agent/tui_gateway/ to verify the client correctly
+              parses all server-provided fields and follows the actual protocol contract.
 
             If you find no issues, say so explicitly. Do NOT summarize what you did
             or describe your process. Output only the review.

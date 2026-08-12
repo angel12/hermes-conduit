@@ -9,6 +9,26 @@ struct ConduitNotificationTarget: Equatable, Identifiable {
     var id: String { "\(profile ?? "default"):\(sessionId):\(type ?? "")" }
 }
 
+enum NotificationSessionResolver {
+    /// Hermes notifications identify a live runtime session, while
+    /// `session.resume` is keyed by the durable stored session. Catalog rows
+    /// retain both identities so a notification can be routed without asking
+    /// the gateway to resume a runtime-only key.
+    static func resumableSessionID(
+        for notificationSessionID: String,
+        in sessions: [SessionSummary]
+    ) -> String {
+        let normalizedID = notificationSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedID.isEmpty else { return normalizedID }
+        guard let session = sessions.first(where: { session in
+            session.id == normalizedID || session.alternateIds.contains(normalizedID)
+        }) else {
+            return normalizedID
+        }
+        return session.storedSessionId ?? session.id
+    }
+}
+
 struct ConduitNotificationPreferences: Codable, Equatable {
     var enabled = true
     var approvalNeeded = true
@@ -56,6 +76,9 @@ final class PushNotificationService: ObservableObject {
     private var deviceToken: String?
     private var tokenContinuation: CheckedContinuation<String, Error>?
     private var navigationRetryTask: Task<Void, Never>?
+    private var pendingRetryCount = 0
+    private let maxNotificationRetriesPerTarget = 1
+    private let retryDelay: Duration
 
     var isEnabled: Bool { registration != nil && preferences.enabled }
     var statusText: String {
@@ -65,7 +88,8 @@ final class PushNotificationService: ObservableObject {
         return "Off"
     }
 
-    private init() {
+    init(retryDelay: Duration = .seconds(1.5)) {
+        self.retryDelay = retryDelay
         if let data = KeychainHelper.loadPushRegistration(),
            let saved = try? JSONDecoder().decode(StoredRegistration.self, from: data) {
             registration = saved
@@ -168,7 +192,9 @@ final class PushNotificationService: ObservableObject {
     func receiveNotificationPayload(_ userInfo: [AnyHashable: Any]) {
         guard let target = notificationTarget(from: userInfo) else { return }
         navigationRetryTask?.cancel()
+        navigationRetryTask = nil
         pendingTarget = target
+        pendingRetryCount = 0
         navigationAttempt += 1
     }
 
@@ -177,16 +203,27 @@ final class PushNotificationService: ObservableObject {
         navigationRetryTask?.cancel()
         navigationRetryTask = nil
         pendingTarget = nil
+        pendingRetryCount = 0
     }
 
-    func retryPendingTarget() {
-        guard pendingTarget != nil else { return }
-        navigationRetryTask?.cancel()
-        navigationRetryTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(1.5))
-            guard !Task.isCancelled else { return }
-            self?.navigationAttempt += 1
+    @discardableResult
+    func handleFailedNotificationRoute(_ target: ConduitNotificationTarget) -> Bool {
+        guard pendingTarget == target,
+              pendingRetryCount < maxNotificationRetriesPerTarget else {
+            clearPendingTarget(target)
+            return false
         }
+        pendingRetryCount += 1
+        navigationRetryTask?.cancel()
+        let retryDelay = self.retryDelay
+        navigationRetryTask = Task { [weak self] in
+            try? await Task.sleep(for: retryDelay)
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            self.navigationRetryTask = nil
+            self.navigationAttempt += 1
+        }
+        return true
     }
 
     private func notificationTarget(from userInfo: [AnyHashable: Any]) -> ConduitNotificationTarget? {

@@ -1162,7 +1162,18 @@ enum MessageNormalizer {
 
         return records.enumerated().map { index, item in
             let obj = item.objectValue ?? [:]
-            let id = obj["session_id"]?.stringValue ?? obj["id"]?.stringValue ?? String(index)
+            let runtimeSessionId = obj["session_id"]?.stringValue
+            let id = runtimeSessionId ?? obj["id"]?.stringValue ?? String(index)
+            let explicitStoredSessionId = ["stored_session_id", "storedSessionId"]
+                .compactMap { obj[$0]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
+            let storedSessionId = explicitStoredSessionId ?? {
+                // The legacy catalog shape exposes the durable ID as `id`
+                // alongside a separate runtime `session_id`. A lone `id` is
+                // ambiguous, so do not label it as a verified stored ID.
+                guard runtimeSessionId != nil else { return nil }
+                return obj["id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+            }()
 
             // Collect alternate IDs
             let altKeys = ["session_id", "id", "stored_session_id", "runtime_session_id", "session_key"]
@@ -1185,6 +1196,7 @@ enum MessageNormalizer {
 
             return SessionSummary(
                 id: id,
+                storedSessionId: storedSessionId,
                 alternateIds: Array(altIds),
                 title: obj["title"]?.stringValue ?? obj["preview"]?.stringValue ?? "Untitled conversation",
                 model: obj["model"]?.stringValue ?? "Hermes",
