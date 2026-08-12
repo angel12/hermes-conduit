@@ -2315,6 +2315,12 @@ final class AppState: ObservableObject {
                 let acceptedSessionIDs: Set<String>
                 if let boundary,
                    let boundarySessionID = boundary.streamSessionIDAtBoundary {
+                    // Do not infer that a newly returned runtime ID belongs
+                    // to this boundary solely because the resume RPC returned
+                    // it. Keep only IDs already accepted for the boundary and
+                    // known as aliases of that catalog session; an empty
+                    // result intentionally disables deduplication rather than
+                    // risking text from a different session.
                     acceptedSessionIDs = boundary.acceptedSessionIDs.intersection(
                         knownSessionIDs(for: boundarySessionID)
                     )
@@ -2713,10 +2719,12 @@ final class AppState: ObservableObject {
     /// in the resume snapshot's cumulative `inflight` projection — replaying
     /// them on top of the seeded live bubble repeats that text. When the exact
     /// stream text at the matching session boundary is known, consume only the
-    /// corresponding prefix of the buffered deltas. Edge whitespace is ignored
+    /// corresponding span of the buffered deltas. Edge whitespace is ignored
     /// consistently with resume seeding, and the raw covered count preserves
-    /// event order when deltas carry that whitespace. Without a matching
-    /// boundary or session, repeated text is ambiguous, so leave events intact.
+    /// event order when deltas carry that whitespace. Interior whitespace is
+    /// not rewritten: a mismatch may be real content, so leave it intact.
+    /// Without a matching boundary or session, repeated text is ambiguous, so
+    /// leave events intact.
     nonisolated static func normalizedReconciliationBoundaryPrefix(
         boundaryText: String?,
         boundarySessionID: String?,
@@ -2843,6 +2851,12 @@ final class AppState: ObservableObject {
                 bufferedTrailingWhitespaceCount
             )
         } else if normalizedCoveredText.hasPrefix(normalizedBufferedDeltaText) {
+            coveredRawCharacters = bufferedDeltaText.count
+        } else if normalizedCoveredText.hasSuffix(normalizedBufferedDeltaText) {
+            // A reconnect can leave the local boundary behind a persisted
+            // portion of the turn. In that case the buffered window may begin
+            // in the middle of the covered span; consume it only when the
+            // entire buffered text is the covered span's suffix.
             coveredRawCharacters = bufferedDeltaText.count
         } else {
             return events

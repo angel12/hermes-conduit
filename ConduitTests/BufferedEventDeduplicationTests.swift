@@ -193,6 +193,38 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         XCTAssertEqual(deltaTexts(in: result), ["bar"])
     }
 
+    func testSuffixAlignedCoveredDeltaIsNotReplayed() {
+        let events: [StreamEvent] = [
+            .messageDelta(sessionId: "s1", text: "C"),
+        ]
+
+        let result = AppState.deduplicatingBufferedEvents(
+            events,
+            againstInflight: "C",
+            knownPrefix: "",
+            sessionID: "s1",
+            coveredText: "BC"
+        )
+
+        XCTAssertTrue(result.isEmpty)
+    }
+
+    func testMidWindowGapDropsSuffixAlignedBufferedDeltas() {
+        let events: [StreamEvent] = [
+            .messageDelta(sessionId: "s1", text: "CD"),
+        ]
+
+        let result = AppState.deduplicatingBufferedEvents(
+            events,
+            againstInflight: "CD",
+            knownPrefix: "",
+            sessionID: "s1",
+            coveredText: "BCD"
+        )
+
+        XCTAssertTrue(result.isEmpty)
+    }
+
     func testMissingBoundaryDoesNotGuessFromText() {
         let events: [StreamEvent] = [
             .messageDelta(sessionId: "s1", text: "aaa"),
