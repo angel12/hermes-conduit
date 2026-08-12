@@ -2324,6 +2324,11 @@ final class AppState: ObservableObject {
                     acceptedSessionIDs = boundary.acceptedSessionIDs.intersection(
                         knownSessionIDs(for: boundarySessionID)
                     )
+                    if !acceptedSessionIDs.contains(result.sessionId) {
+                        sessionCatalogLog.debug(
+                            "Skipping buffered delta dedup because resumed session \(result.sessionId, privacy: .public) is not a catalog-confirmed alias of the reconciliation boundary"
+                        )
+                    }
                 } else {
                     acceptedSessionIDs = [result.sessionId]
                 }
@@ -2852,18 +2857,17 @@ final class AppState: ObservableObject {
             )
         } else if normalizedCoveredText.hasPrefix(normalizedBufferedDeltaText) {
             coveredRawCharacters = bufferedDeltaText.count
-        } else if normalizedCoveredText.hasSuffix(normalizedBufferedDeltaText) {
-            // A reconnect can leave the local boundary behind a persisted
-            // portion of the turn. In that case the buffered window may begin
-            // in the middle of the covered span; consume it only when the
-            // entire buffered text is the covered span's suffix.
-            coveredRawCharacters = bufferedDeltaText.count
         } else {
-            let overlap = Self.longestSuffixPrefixOverlapLength(
+            let overlaps = Self.suffixPrefixOverlapLengths(
                 covered: normalizedCoveredText,
                 buffered: normalizedBufferedDeltaText
             )
-            guard overlap > 0 else { return events }
+            guard overlaps.count == 1, let overlap = overlaps.first else {
+                // Repeated content can produce multiple valid alignments. A
+                // content-only guess could consume genuinely new text, so
+                // preserve the events when the offset is ambiguous.
+                return events
+            }
             let leadingWhitespaceCount = bufferedDeltaText.prefix { $0.isWhitespace }.count
             coveredRawCharacters = leadingWhitespaceCount + overlap
         }
@@ -2895,15 +2899,16 @@ final class AppState: ObservableObject {
         return deduplicated
     }
 
-    /// Returns the longest prefix of `buffered` that is also a suffix of
+    /// Returns every non-empty prefix of `buffered` that is also a suffix of
     /// `covered`. The prefix-function scan stays linear in the cumulative
-    /// projection size while preserving the boundary-derived alignment rule.
-    nonisolated static func longestSuffixPrefixOverlapLength(
+    /// projection size; callers can reject repeated-content ambiguity when
+    /// more than one alignment is possible.
+    nonisolated static func suffixPrefixOverlapLengths(
         covered: String,
         buffered: String
-    ) -> Int {
+    ) -> [Int] {
         let pattern = Array(buffered)
-        guard !pattern.isEmpty, !covered.isEmpty else { return 0 }
+        guard !pattern.isEmpty, !covered.isEmpty else { return [] }
 
         var prefixLengths = Array(repeating: 0, count: pattern.count)
         var prefixLength = 0
@@ -2917,8 +2922,10 @@ final class AppState: ObservableObject {
             prefixLengths[index] = prefixLength
         }
 
+        let text = Array(covered)
         var matched = 0
-        for character in covered {
+        var overlaps: [Int] = []
+        for (index, character) in text.enumerated() {
             while matched > 0, pattern[matched] != character {
                 matched = prefixLengths[matched - 1]
             }
@@ -2926,10 +2933,18 @@ final class AppState: ObservableObject {
                 matched += 1
             }
             if matched == pattern.count {
+                if index == text.count - 1 {
+                    overlaps.append(pattern.count)
+                }
                 matched = prefixLengths[matched - 1]
             }
         }
-        return matched
+
+        while matched > 0 {
+            overlaps.append(matched)
+            matched = prefixLengths[matched - 1]
+        }
+        return overlaps
     }
 
     /// `session.resume.inflight` is a cumulative projection on some gateways.

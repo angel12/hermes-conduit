@@ -272,6 +272,22 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         }
     }
 
+    func testAmbiguousRepeatedStraddleKeepsBufferedText() {
+        let events: [StreamEvent] = [
+            .messageDelta(sessionId: "s1", text: "bcabc"),
+        ]
+
+        let result = AppState.deduplicatingBufferedEvents(
+            events,
+            againstInflight: "bcabc",
+            knownPrefix: "",
+            sessionID: "s1",
+            coveredText: "abcabc"
+        )
+
+        XCTAssertEqual(deltaTexts(in: result), ["bcabc"])
+    }
+
     func testMissingBoundaryDoesNotGuessFromText() {
         let events: [StreamEvent] = [
             .messageDelta(sessionId: "s1", text: "aaa"),
