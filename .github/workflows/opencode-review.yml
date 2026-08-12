@@ -34,7 +34,7 @@ jobs:
           fi
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
       - name: Run opencode review
-        run: GITHUB_EVENT_NAME=pull_request opencode github run
+        run: GITHUB_EVENT_NAME=pull_request GITHUB_ACTOR=${{ github.repository_owner.login }} opencode github run
         env:
           OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.OPENCODE_GH_PAT }}
