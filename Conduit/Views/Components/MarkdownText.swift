@@ -867,6 +867,15 @@ private struct RemoteMarkdownImage: View {
 /// AsyncImage is fast for ordinary HTTPS hosts. Some image CDNs reject its
 /// URLSession user agent or redirect to HTTP; WebKit follows the same browser
 /// path as the source link, but is isolated to this image-only fallback.
+enum WebFallbackImageLabel {
+    static func title(alt: String, destinationAvailable: Bool) -> String {
+        if destinationAvailable {
+            return alt.isEmpty ? "Open image" : "Image unavailable — open source"
+        }
+        return alt.isEmpty ? "Image unavailable" : "\(alt) unavailable"
+    }
+}
+
 private struct WebFallbackImage: View {
     let url: String
     let alt: String
@@ -893,17 +902,21 @@ private struct WebFallbackImage: View {
 
     @ViewBuilder
     private var fallbackLabel: some View {
-        let label = Label(
-            alt.isEmpty ? "Open image" : "Image unavailable — open source",
-            systemImage: "photo.badge.exclamationmark"
-        )
-        .font(.footnote.weight(.semibold))
-
         if let destination = URL(string: url) ?? URL(string: url.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "") {
-            Link(destination: destination) { label }
+            Link(destination: destination) {
+                Label(
+                    WebFallbackImageLabel.title(alt: alt, destinationAvailable: true),
+                    systemImage: "photo.badge.exclamationmark"
+                )
+                .font(.footnote.weight(.semibold))
+            }
                 .tint(.conduitAccent)
         } else {
-            label
+            Label(
+                WebFallbackImageLabel.title(alt: alt, destinationAvailable: false),
+                systemImage: "photo.badge.exclamationmark"
+            )
+                .font(.footnote.weight(.semibold))
                 .foregroundStyle(.secondary)
         }
     }
