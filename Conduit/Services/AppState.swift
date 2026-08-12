@@ -2707,6 +2707,14 @@ final class AppState: ObservableObject {
         let covered = inflight.count - knownPrefix.count
         guard covered > 0 else { return events }
 
+        let bufferedDeltaTexts = events.compactMap { event in
+            if case .messageDelta(_, let text) = event {
+                return text
+            }
+            return nil
+        }
+        guard !bufferedDeltaTexts.isEmpty else { return events }
+
         let deltaSessionIDs = Set(events.compactMap { event in
             if case .messageDelta(let sessionId, _) = event {
                 return sessionId
@@ -2714,6 +2722,13 @@ final class AppState: ObservableObject {
             return nil
         })
         guard deltaSessionIDs.count == 1 else {
+            return events
+        }
+
+        let bufferedDeltaText = bufferedDeltaTexts.joined()
+        let inflightSuffix = String(inflight.dropFirst(knownPrefix.count))
+        guard bufferedDeltaText.hasPrefix(inflightSuffix)
+                || inflightSuffix.hasPrefix(bufferedDeltaText) else {
             return events
         }
 

@@ -143,6 +143,19 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         XCTAssertEqual(deltaTexts(in: result), ["a"])
     }
 
+    func testMismatchedInflightSuffixDoesNotDropNewText() {
+        let events: [StreamEvent] = [
+            .messageDelta(sessionId: "s1", text: "C"),
+        ]
+        let result = AppState.deduplicatingBufferedEvents(
+            events,
+            againstInflight: "AB",
+            knownPrefix: "A"
+        )
+
+        XCTAssertEqual(deltaTexts(in: result), ["C"])
+    }
+
     func testMissingBoundaryDoesNotGuessFromText() {
         let events: [StreamEvent] = [
             .messageDelta(sessionId: "s1", text: "aaa"),
