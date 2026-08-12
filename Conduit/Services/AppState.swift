@@ -2859,7 +2859,13 @@ final class AppState: ObservableObject {
             // entire buffered text is the covered span's suffix.
             coveredRawCharacters = bufferedDeltaText.count
         } else {
-            return events
+            let overlap = Self.longestSuffixPrefixOverlapLength(
+                covered: normalizedCoveredText,
+                buffered: normalizedBufferedDeltaText
+            )
+            guard overlap > 0 else { return events }
+            let leadingWhitespaceCount = bufferedDeltaText.prefix { $0.isWhitespace }.count
+            coveredRawCharacters = leadingWhitespaceCount + overlap
         }
 
         var remainingCoverage = coveredRawCharacters
@@ -2887,6 +2893,43 @@ final class AppState: ObservableObject {
             }
         }
         return deduplicated
+    }
+
+    /// Returns the longest prefix of `buffered` that is also a suffix of
+    /// `covered`. The prefix-function scan stays linear in the cumulative
+    /// projection size while preserving the boundary-derived alignment rule.
+    nonisolated static func longestSuffixPrefixOverlapLength(
+        covered: String,
+        buffered: String
+    ) -> Int {
+        let pattern = Array(buffered)
+        guard !pattern.isEmpty, !covered.isEmpty else { return 0 }
+
+        var prefixLengths = Array(repeating: 0, count: pattern.count)
+        var prefixLength = 0
+        for index in 1..<pattern.count {
+            while prefixLength > 0, pattern[index] != pattern[prefixLength] {
+                prefixLength = prefixLengths[prefixLength - 1]
+            }
+            if pattern[index] == pattern[prefixLength] {
+                prefixLength += 1
+            }
+            prefixLengths[index] = prefixLength
+        }
+
+        var matched = 0
+        for character in covered {
+            while matched > 0, pattern[matched] != character {
+                matched = prefixLengths[matched - 1]
+            }
+            if pattern[matched] == character {
+                matched += 1
+            }
+            if matched == pattern.count {
+                matched = prefixLengths[matched - 1]
+            }
+        }
+        return matched
     }
 
     /// `session.resume.inflight` is a cumulative projection on some gateways.

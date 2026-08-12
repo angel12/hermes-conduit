@@ -304,6 +304,64 @@ final class AppStateChatResumeTests: XCTestCase {
         XCTAssertEqual(harness.appState.streamingText, "C")
     }
 
+    func testResumeDedupKeepsOnlyNewTextWhenBufferedWindowStraddlesCoverage() async {
+        let openGate = ControlledSuspension()
+        let active = session("stored-a")
+        let harness = makeHarness(
+            lifecycleOperations: ChatResumeLifecycleOperations(
+                loadCatalog: { _, _ in [active] },
+                openSession: { _, sessionID in
+                    await openGate.suspend()
+                    return SessionResumeResult(
+                        sessionId: sessionID,
+                        messages: [
+                            ChatMessage(
+                                id: "persisted-assistant",
+                                role: .assistant,
+                                content: "AB",
+                                timestamp: "1"
+                            )
+                        ],
+                        snapshot: SessionRuntimeSnapshot(
+                            object: [:],
+                            inflight: .object([
+                                "assistant": .string("ABCD")
+                            ])
+                        )
+                    )
+                },
+                refreshContext: { _, _ in }
+            )
+        )
+        installComposerClient(in: harness)
+        harness.appState.sessions = [active]
+        harness.appState.activeSessionId = active.id
+        harness.appState.handleStreamEvent(
+            .messageDelta(sessionId: active.id, text: "A")
+        )
+
+        let refresh = Task { @MainActor in
+            await harness.appState.refreshActiveSession()
+        }
+        await openGate.waitUntilSuspended()
+        harness.appState.handleStreamEvent(
+            .messageDelta(sessionId: active.id, text: "CDE")
+        )
+        harness.appState.handleStreamEvent(
+            .toolStart(sessionId: active.id, toolName: "Bash", toolInput: "ls")
+        )
+        openGate.resume()
+        await refresh.value
+
+        harness.appState.showSidebar = true
+        harness.appState.showSidebar = false
+        let partials = harness.appState.messages.filter { $0.role == .partial }
+        let toolIndex = harness.appState.messages.firstIndex { $0.role == .tool }
+        let partialIndex = harness.appState.messages.firstIndex { $0.role == .partial }
+        XCTAssertEqual(partials.map(\.content), ["CDE"])
+        XCTAssertEqual(toolIndex, partialIndex.map { $0 + 1 })
+    }
+
     func testResumeDedupAcceptsAlternateSessionIDForBufferedDelta() async {
         let openGate = ControlledSuspension()
         let active = session("stored-a", alternateIDs: ["runtime-a"])

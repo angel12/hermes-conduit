@@ -225,6 +225,53 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         XCTAssertTrue(result.isEmpty)
     }
 
+    func testStraddledCoveredDeltaKeepsOnlyNewSuffix() {
+        let events: [StreamEvent] = [
+            .messageDelta(sessionId: "s1", text: "CDE"),
+        ]
+
+        let result = AppState.deduplicatingBufferedEvents(
+            events,
+            againstInflight: "CDE",
+            knownPrefix: "",
+            sessionID: "s1",
+            coveredText: "BCD"
+        )
+
+        XCTAssertEqual(deltaTexts(in: result), ["E"])
+    }
+
+    func testStraddledCoveragePreservesInterleavedEventOrder() {
+        let events: [StreamEvent] = [
+            .messageDelta(sessionId: "s1", text: "CDE"),
+            .toolStart(sessionId: "s1", toolName: "Bash", toolInput: "ls"),
+            .messageDelta(sessionId: "s1", text: "F"),
+        ]
+
+        let result = AppState.deduplicatingBufferedEvents(
+            events,
+            againstInflight: "CDEF",
+            knownPrefix: "",
+            sessionID: "s1",
+            coveredText: "BCD"
+        )
+
+        XCTAssertEqual(result.count, 3)
+        if case .messageDelta(_, let text) = result[0] {
+            XCTAssertEqual(text, "E")
+        } else {
+            XCTFail("Expected the uncovered suffix before toolStart")
+        }
+        if case .toolStart = result[1] {} else {
+            XCTFail("Expected toolStart to remain between the deltas")
+        }
+        if case .messageDelta(_, let text) = result[2] {
+            XCTAssertEqual(text, "F")
+        } else {
+            XCTFail("Expected the later delta after toolStart")
+        }
+    }
+
     func testMissingBoundaryDoesNotGuessFromText() {
         let events: [StreamEvent] = [
             .messageDelta(sessionId: "s1", text: "aaa"),
