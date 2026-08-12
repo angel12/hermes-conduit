@@ -2289,9 +2289,6 @@ final class AppState: ObservableObject {
                 settleReconciliation(token, automaticSyncOperationID: automaticSyncOperationID)
                 return false
             }
-            let resumedInflightText = result.snapshot.hasLiveProjection
-                ? streamingBuffer
-                : nil
             await refreshChatResumeContext(sessionId: result.sessionId, using: client)
 
             guard automaticChatResumeWorkIsCurrent(
@@ -2313,15 +2310,15 @@ final class AppState: ObservableObject {
                 }
                 : []
             if result.snapshot.hasLiveProjection {
+                let resumedInflightText = streamingBuffer
                 let knownPrefix: String?
-                if let boundary = reconciliation,
-                   boundary.token == token,
-                   let boundarySessionID = boundary.streamSessionIDAtBoundary,
-                   !boundarySessionID.isEmpty,
-                   (boundarySessionID == result.sessionId
-                    || boundarySessionID == boundary.requestedSessionId
-                    || boundary.acceptedSessionIDs.contains(boundarySessionID)) {
-                    knownPrefix = boundary.streamTextAtBoundary
+                if let boundary = reconciliation, boundary.token == token {
+                    knownPrefix = Self.normalizedReconciliationBoundaryPrefix(
+                        boundaryText: boundary.streamTextAtBoundary,
+                        boundarySessionID: boundary.streamSessionIDAtBoundary,
+                        resumedSessionID: result.sessionId,
+                        after: messages
+                    )
                 } else {
                     knownPrefix = nil
                 }
@@ -2329,11 +2326,12 @@ final class AppState: ObservableObject {
                 // The live bubble was just seeded from the cumulative inflight
                 // projection, which already includes deltas emitted while this
                 // reconciliation was in flight. Replay only the portion beyond
-                // the exact text captured at the reconciliation boundary.
+                // the normalized text captured at the same session boundary.
                 bufferedEvents = Self.deduplicatingBufferedEvents(
                     bufferedEvents,
-                    againstInflight: resumedInflightText ?? "",
-                    knownPrefix: knownPrefix
+                    againstInflight: resumedInflightText,
+                    knownPrefix: knownPrefix,
+                    sessionID: result.sessionId
                 )
             }
             bufferedEvents.forEach(applyStreamEvent)
@@ -2691,21 +2689,43 @@ final class AppState: ObservableObject {
     /// Deltas buffered while reconciliation ran are usually already contained
     /// in the resume snapshot's cumulative `inflight` projection — replaying
     /// them on top of the seeded live bubble repeats that text. When the exact
-    /// stream text at the reconciliation boundary is known, consume only the
-    /// corresponding prefix of the buffered deltas. Without that boundary,
-    /// repeated text is ambiguous, so leave the events untouched.
+    /// stream text at the matching session boundary is known, consume only the
+    /// corresponding prefix of the buffered deltas. Edge whitespace is ignored
+    /// consistently with resume seeding, and the raw covered count preserves
+    /// event order when deltas carry that whitespace. Without a matching
+    /// boundary or session, repeated text is ambiguous, so leave events intact.
+    nonisolated static func normalizedReconciliationBoundaryPrefix(
+        boundaryText: String?,
+        boundarySessionID: String?,
+        resumedSessionID: String,
+        after messages: [ChatMessage]
+    ) -> String? {
+        guard let boundaryText,
+              let boundarySessionID,
+              !boundarySessionID.isEmpty,
+              boundarySessionID == resumedSessionID else {
+            return nil
+        }
+        return unpersistedInflightAssistantText(boundaryText, after: messages)
+    }
+
     nonisolated static func deduplicatingBufferedEvents(
         _ events: [StreamEvent],
         againstInflight inflight: String,
-        knownPrefix: String?
+        knownPrefix: String?,
+        sessionID: String
     ) -> [StreamEvent] {
-        guard let knownPrefix,
-              inflight.hasPrefix(knownPrefix) else {
+        let normalizedInflight = inflight.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedKnownPrefix = knownPrefix?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let normalizedKnownPrefix,
+              normalizedInflight.hasPrefix(normalizedKnownPrefix) else {
             return events
         }
 
-        let covered = inflight.count - knownPrefix.count
-        guard covered > 0 else { return events }
+        let coveredText = String(
+            normalizedInflight.dropFirst(normalizedKnownPrefix.count)
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !coveredText.isEmpty else { return events }
 
         let bufferedDeltaTexts = events.compactMap { event in
             if case .messageDelta(_, let text) = event {
@@ -2721,18 +2741,28 @@ final class AppState: ObservableObject {
             }
             return nil
         })
-        guard deltaSessionIDs.count == 1 else {
+        guard deltaSessionIDs.count == 1,
+              deltaSessionIDs.first == sessionID else {
             return events
         }
 
         let bufferedDeltaText = bufferedDeltaTexts.joined()
-        let inflightSuffix = String(inflight.dropFirst(knownPrefix.count))
-        guard bufferedDeltaText.hasPrefix(inflightSuffix)
-                || inflightSuffix.hasPrefix(bufferedDeltaText) else {
+        let normalizedBufferedDeltaText = bufferedDeltaText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedBufferedDeltaText.isEmpty else { return events }
+
+        let coveredRawCharacters: Int
+        if normalizedBufferedDeltaText == coveredText {
+            coveredRawCharacters = bufferedDeltaText.count
+        } else if normalizedBufferedDeltaText.hasPrefix(coveredText) {
+            let leadingWhitespaceCount = bufferedDeltaText.prefix { $0.isWhitespace }.count
+            coveredRawCharacters = leadingWhitespaceCount + coveredText.count
+        } else if coveredText.hasPrefix(normalizedBufferedDeltaText) {
+            coveredRawCharacters = bufferedDeltaText.count
+        } else {
             return events
         }
 
-        var remainingCoverage = covered
+        var remainingCoverage = coveredRawCharacters
         var deduplicated: [StreamEvent] = []
         deduplicated.reserveCapacity(events.count)
         for event in events {
@@ -2763,7 +2793,7 @@ final class AppState: ObservableObject {
     /// When its already-persisted prefix is also present in the recovered
     /// transcript, rendering it as the live bubble repeats the last reply.
     /// Keep only the unpersisted suffix so the next delta continues naturally.
-    static func unpersistedInflightAssistantText(
+    nonisolated static func unpersistedInflightAssistantText(
         _ inflight: String,
         after messages: [ChatMessage]
     ) -> String {

@@ -120,6 +120,112 @@ final class AppStateChatResumeTests: XCTestCase {
         XCTAssertFalse(harness.appState.activeChatScrollSessionIdentity.isReconciling)
     }
 
+    func testResumeDedupNormalizesPersistedBoundaryBeforeReplayingBufferedDelta() async {
+        let openGate = ControlledSuspension()
+        let active = session("stored-a")
+        let persistedText = "Let me find the transcript."
+        let harness = makeHarness(
+            lifecycleOperations: ChatResumeLifecycleOperations(
+                loadCatalog: { _, _ in [active] },
+                openSession: { _, sessionID in
+                    await openGate.suspend()
+                    return SessionResumeResult(
+                        sessionId: sessionID,
+                        messages: [
+                            ChatMessage(
+                                id: "persisted-assistant",
+                                role: .assistant,
+                                content: persistedText,
+                                timestamp: "1"
+                            )
+                        ],
+                        snapshot: SessionRuntimeSnapshot(
+                            object: [:],
+                            inflight: .object([
+                                "assistant": .string("\(persistedText) I found it.")
+                            ])
+                        )
+                    )
+                },
+                refreshContext: { _, _ in }
+            )
+        )
+        installComposerClient(in: harness)
+        harness.appState.sessions = [active]
+        harness.appState.activeSessionId = active.id
+        harness.appState.messages = [
+            ChatMessage(
+                id: "persisted-assistant",
+                role: .assistant,
+                content: persistedText,
+                timestamp: "1"
+            )
+        ]
+        harness.appState.handleStreamEvent(
+            .messageDelta(sessionId: active.id, text: persistedText)
+        )
+
+        let refresh = Task { @MainActor in
+            await harness.appState.refreshActiveSession()
+        }
+        await openGate.waitUntilSuspended()
+        harness.appState.handleStreamEvent(
+            .messageDelta(sessionId: active.id, text: " I found it.")
+        )
+        openGate.resume()
+        await refresh.value
+
+        // Force the authoritative streaming buffer into the published test
+        // projection so a wrongly replayed buffered delta is observable.
+        harness.appState.showSidebar = true
+        harness.appState.showSidebar = false
+        XCTAssertEqual(harness.appState.streamingText, "I found it.")
+    }
+
+    func testResumeDoesNotUsePreviousSessionBoundaryForNewSessionDelta() async {
+        let contextGate = ControlledSuspension()
+        let previous = session("stored-old")
+        let resumedSessionID = "runtime-new"
+        let harness = makeHarness(
+            lifecycleOperations: ChatResumeLifecycleOperations(
+                loadCatalog: { _, _ in [previous] },
+                openSession: { _, _ in
+                    return SessionResumeResult(
+                        sessionId: resumedSessionID,
+                        messages: [],
+                        snapshot: SessionRuntimeSnapshot(
+                            object: [:],
+                            inflight: .object([
+                                "assistant": .string("Okay next")
+                            ])
+                        )
+                    )
+                },
+                refreshContext: { _, _ in await contextGate.suspend() }
+            )
+        )
+        installComposerClient(in: harness)
+        harness.appState.sessions = [previous]
+        harness.appState.activeSessionId = previous.id
+        harness.appState.handleStreamEvent(
+            .messageDelta(sessionId: previous.id, text: "Okay")
+        )
+
+        let refresh = Task { @MainActor in
+            await harness.appState.refreshActiveSession()
+        }
+        await contextGate.waitUntilSuspended()
+        harness.appState.handleStreamEvent(
+            .messageDelta(sessionId: resumedSessionID, text: " next")
+        )
+        contextGate.resume()
+        await refresh.value
+
+        harness.appState.showSidebar = true
+        harness.appState.showSidebar = false
+        XCTAssertEqual(harness.appState.streamingText, "Okay next next")
+    }
+
     func testCancelledExplicitSessionSwitchDoesNotLeaveSynchronizationStuck() async {
         let openGate = ControlledSuspension()
         let harness = makeHarness(

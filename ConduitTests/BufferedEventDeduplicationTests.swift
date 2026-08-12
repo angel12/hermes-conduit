@@ -35,7 +35,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         let result = AppState.deduplicatingBufferedEvents(
             events,
             againstInflight: "The fox jumps over the lazy dog.",
-            knownPrefix: "The fox jumps "
+            knownPrefix: "The fox jumps ",
+            sessionID: "s1"
         )
         XCTAssertTrue(result.isEmpty)
     }
@@ -50,7 +51,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         let result = AppState.deduplicatingBufferedEvents(
             events,
             againstInflight: "The fox jumps over the lazy",
-            knownPrefix: "The fox jumps "
+            knownPrefix: "The fox jumps ",
+            sessionID: "s1"
         )
         XCTAssertEqual(deltaTexts(in: result), [" dog."])
     }
@@ -64,7 +66,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         let result = AppState.deduplicatingBufferedEvents(
             events,
             againstInflight: "unrelated snapshot",
-            knownPrefix: "The fox jumps "
+            knownPrefix: "The fox jumps ",
+            sessionID: "s1"
         )
         XCTAssertEqual(deltaTexts(in: result), ["fresh text"])
     }
@@ -78,7 +81,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         let result = AppState.deduplicatingBufferedEvents(
             events,
             againstInflight: "Everything is done.",
-            knownPrefix: "Everything is "
+            knownPrefix: "Everything is ",
+            sessionID: "s1"
         )
         XCTAssertEqual(result.count, 2)
         if case .toolStart = result[0] {} else {
@@ -98,7 +102,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         let result = AppState.deduplicatingBufferedEvents(
             events,
             againstInflight: "abc",
-            knownPrefix: ""
+            knownPrefix: "",
+            sessionID: "s1"
         )
 
         XCTAssertEqual(result.count, 3)
@@ -124,7 +129,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         let result = AppState.deduplicatingBufferedEvents(
             events,
             againstInflight: "aaaa",
-            knownPrefix: "aaaa"
+            knownPrefix: "aaaa",
+            sessionID: "s1"
         )
 
         XCTAssertEqual(deltaTexts(in: result), ["aaa"])
@@ -137,7 +143,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         let result = AppState.deduplicatingBufferedEvents(
             events,
             againstInflight: "aaaaaa",
-            knownPrefix: "aaaa"
+            knownPrefix: "aaaa",
+            sessionID: "s1"
         )
 
         XCTAssertEqual(deltaTexts(in: result), ["a"])
@@ -150,10 +157,25 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         let result = AppState.deduplicatingBufferedEvents(
             events,
             againstInflight: "AB",
-            knownPrefix: "A"
+            knownPrefix: "A",
+            sessionID: "s1"
         )
 
         XCTAssertEqual(deltaTexts(in: result), ["C"])
+    }
+
+    func testWhitespaceAroundCoveredDeltaIsNotReplayed() {
+        let events: [StreamEvent] = [
+            .messageDelta(sessionId: "s1", text: " I found it. "),
+        ]
+        let result = AppState.deduplicatingBufferedEvents(
+            events,
+            againstInflight: "I found it.",
+            knownPrefix: "",
+            sessionID: "s1"
+        )
+
+        XCTAssertTrue(result.isEmpty)
     }
 
     func testMissingBoundaryDoesNotGuessFromText() {
@@ -163,7 +185,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         let result = AppState.deduplicatingBufferedEvents(
             events,
             againstInflight: "aaaa",
-            knownPrefix: nil
+            knownPrefix: nil,
+            sessionID: "s1"
         )
 
         XCTAssertEqual(deltaTexts(in: result), ["aaa"])
@@ -177,7 +200,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         let result = AppState.deduplicatingBufferedEvents(
             events,
             againstInflight: "abc",
-            knownPrefix: ""
+            knownPrefix: "",
+            sessionID: "s1"
         )
 
         XCTAssertEqual(deltaSessionIDs(in: result), ["s1", "s2"])
@@ -191,7 +215,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         let result = AppState.deduplicatingBufferedEvents(
             events,
             againstInflight: "",
-            knownPrefix: "prefix"
+            knownPrefix: "prefix",
+            sessionID: "s1"
         )
         XCTAssertEqual(deltaTexts(in: result), ["hello"])
     }
@@ -203,7 +228,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         let result = AppState.deduplicatingBufferedEvents(
             events,
             againstInflight: "xyz abc",
-            knownPrefix: "xyz "
+            knownPrefix: "xyz ",
+            sessionID: "runtime-42"
         )
         guard case .messageDelta(let sessionId, let text)? = result.first else {
             return XCTFail("Expected a merged delta")
