@@ -133,6 +133,13 @@ enum DashboardTicketBridgeError: LocalizedError {
 /// configuration → userContentController → bridge) that `deinit` can never
 /// break — every replaced bridge would keep a WebKit content process alive
 /// for the app's lifetime. The proxy holds the bridge weakly instead.
+///
+/// WebKit delivers `userContentController(_:didReceive:)` on the main thread,
+/// and the proxied bridge is `@MainActor`; marking the proxy `@MainActor` too
+/// makes that isolation contract explicit so the forward into the bridge needs
+/// no implicit cross-actor hop and stays correct under Swift 6 strict
+/// concurrency.
+@MainActor
 private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
     private weak var delegate: WKScriptMessageHandler?
 
@@ -182,6 +189,17 @@ final class DashboardTicketBridge: NSObject {
     }
 
     deinit {
+        // The retain-cycle fix is what makes deallocation reachable at all, so
+        // `deinit` can now run while requests are still pending. Removing the
+        // message handler alone leaves their continuations awaiting a JS reply
+        // that can never arrive: the proxy's weak delegate is already nil and
+        // silently drops the posted message. Resume them now so callers see
+        // `.notReady` instead of hanging for a response that will never come.
+        // (The dictionary is torn down with the bridge, so only the resumptions
+        // matter here — nothing else can resume them once the bridge is gone.)
+        for continuation in pendingRequests.values {
+            continuation.resume(throwing: DashboardTicketBridgeError.notReady)
+        }
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "dashboard-response")
     }
 
