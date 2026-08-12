@@ -2365,7 +2365,10 @@ final class AppState: ObservableObject {
                     knownPrefix: knownPrefix,
                     sessionID: result.sessionId,
                     acceptedSessionIDs: acceptedSessionIDs,
-                    coveredText: coveredText
+                    coveredText: coveredText,
+                    hasBoundaryAnchor: boundary?.streamTextAtBoundary?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .isEmpty == false
                 )
             }
             bufferedEvents.forEach(applyStreamEvent)
@@ -2791,7 +2794,8 @@ final class AppState: ObservableObject {
         knownPrefix: String?,
         sessionID: String,
         acceptedSessionIDs: Set<String> = [],
-        coveredText explicitCoveredText: String? = nil
+        coveredText explicitCoveredText: String? = nil,
+        hasBoundaryAnchor: Bool = false
     ) -> [StreamEvent] {
         let coveredText: String
         if let explicitCoveredText {
@@ -2872,8 +2876,17 @@ final class AppState: ObservableObject {
                 knownPrefix: knownPrefix,
                 sessionID: sessionID,
                 acceptedSessionIDs: acceptedSessionIDs,
-                coveredText: explicitCoveredText
+                coveredText: explicitCoveredText,
+                hasBoundaryAnchor: hasBoundaryAnchor
             ) + eventsAfterNewTurn
+        }
+
+        guard hasBoundaryAnchor else {
+            // Content equality cannot distinguish a fresh turn that happens
+            // to repeat the snapshot. Without a non-empty stream boundary (or
+            // the explicit message-start marker above), preserve the events
+            // rather than risking loss of genuinely new text.
+            return events
         }
 
         let bufferedDeltaText = bufferedDeltaTexts.joined()

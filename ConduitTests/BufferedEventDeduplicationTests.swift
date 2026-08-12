@@ -36,7 +36,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             events,
             againstInflight: "The fox jumps over the lazy dog.",
             knownPrefix: "The fox jumps ",
-            sessionID: "s1"
+            sessionID: "s1",
+            hasBoundaryAnchor: true
         )
         XCTAssertTrue(result.isEmpty)
     }
@@ -52,7 +53,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             events,
             againstInflight: "The fox jumps over the lazy",
             knownPrefix: "The fox jumps ",
-            sessionID: "s1"
+            sessionID: "s1",
+            hasBoundaryAnchor: true
         )
         XCTAssertEqual(deltaTexts(in: result), [" dog."])
     }
@@ -82,7 +84,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             events,
             againstInflight: "Everything is done.",
             knownPrefix: "Everything is ",
-            sessionID: "s1"
+            sessionID: "s1",
+            hasBoundaryAnchor: true
         )
         XCTAssertEqual(result.count, 2)
         if case .toolStart = result[0] {} else {
@@ -103,7 +106,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             events,
             againstInflight: "abc",
             knownPrefix: "",
-            sessionID: "s1"
+            sessionID: "s1",
+            hasBoundaryAnchor: true
         )
 
         XCTAssertEqual(result.count, 3)
@@ -130,7 +134,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             events,
             againstInflight: "aaaa",
             knownPrefix: "aaaa",
-            sessionID: "s1"
+            sessionID: "s1",
+            hasBoundaryAnchor: true
         )
 
         XCTAssertEqual(deltaTexts(in: result), ["aaa"])
@@ -144,7 +149,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             events,
             againstInflight: "aaaaaa",
             knownPrefix: "aaaa",
-            sessionID: "s1"
+            sessionID: "s1",
+            hasBoundaryAnchor: true
         )
 
         XCTAssertEqual(deltaTexts(in: result), ["a"])
@@ -158,7 +164,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             events,
             againstInflight: "AB",
             knownPrefix: "A",
-            sessionID: "s1"
+            sessionID: "s1",
+            hasBoundaryAnchor: true
         )
 
         XCTAssertEqual(deltaTexts(in: result), ["C"])
@@ -172,7 +179,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             events,
             againstInflight: "I found it.",
             knownPrefix: "",
-            sessionID: "s1"
+            sessionID: "s1",
+            hasBoundaryAnchor: true
         )
 
         XCTAssertTrue(result.isEmpty)
@@ -187,7 +195,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             events,
             againstInflight: "foo ",
             knownPrefix: "",
-            sessionID: "s1"
+            sessionID: "s1",
+            hasBoundaryAnchor: true
         )
 
         XCTAssertEqual(deltaTexts(in: result), ["bar"])
@@ -203,7 +212,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             againstInflight: "C",
             knownPrefix: "",
             sessionID: "s1",
-            coveredText: "BC"
+            coveredText: "BC",
+            hasBoundaryAnchor: true
         )
 
         XCTAssertTrue(result.isEmpty)
@@ -219,7 +229,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             againstInflight: "CD",
             knownPrefix: "",
             sessionID: "s1",
-            coveredText: "BCD"
+            coveredText: "BCD",
+            hasBoundaryAnchor: true
         )
 
         XCTAssertTrue(result.isEmpty)
@@ -235,7 +246,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             againstInflight: "CDE",
             knownPrefix: "",
             sessionID: "s1",
-            coveredText: "BCD"
+            coveredText: "BCD",
+            hasBoundaryAnchor: true
         )
 
         XCTAssertEqual(deltaTexts(in: result), ["E"])
@@ -253,7 +265,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             againstInflight: "CDEF",
             knownPrefix: "",
             sessionID: "s1",
-            coveredText: "BCD"
+            coveredText: "BCD",
+            hasBoundaryAnchor: true
         )
 
         XCTAssertEqual(result.count, 3)
@@ -282,7 +295,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             againstInflight: "bcabc",
             knownPrefix: "",
             sessionID: "s1",
-            coveredText: "abcabc"
+            coveredText: "abcabc",
+            hasBoundaryAnchor: true
         )
 
         XCTAssertEqual(deltaTexts(in: result), ["bcabc"])
@@ -317,7 +331,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             againstInflight: "old",
             knownPrefix: "",
             sessionID: "s1",
-            coveredText: "old"
+            coveredText: "old",
+            hasBoundaryAnchor: true
         )
 
         XCTAssertEqual(deltaTexts(in: result), ["xyz more"])
@@ -325,6 +340,38 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         if case .messageStart = result[0] {} else {
             XCTFail("Expected the new-turn marker to remain before its delta")
         }
+    }
+
+    func testNoMarkerPrefixCollisionPreservesBufferedTextWithoutBoundaryProof() {
+        let events: [StreamEvent] = [
+            .messageDelta(sessionId: "s1", text: "xyz more"),
+        ]
+
+        let result = AppState.deduplicatingBufferedEvents(
+            events,
+            againstInflight: "xyz",
+            knownPrefix: "",
+            sessionID: "s1",
+            coveredText: "xyz"
+        )
+
+        XCTAssertEqual(deltaTexts(in: result), ["xyz more"])
+    }
+
+    func testNoMarkerExactCollisionPreservesBufferedTextWithoutBoundaryProof() {
+        let events: [StreamEvent] = [
+            .messageDelta(sessionId: "s1", text: "xyz"),
+        ]
+
+        let result = AppState.deduplicatingBufferedEvents(
+            events,
+            againstInflight: "xyz",
+            knownPrefix: "",
+            sessionID: "s1",
+            coveredText: "xyz"
+        )
+
+        XCTAssertEqual(deltaTexts(in: result), ["xyz"])
     }
 
     func testExplicitCoverageMustMatchSeededInflightBeforeDeduplicating() {
@@ -410,7 +457,8 @@ final class BufferedEventDeduplicationTests: XCTestCase {
             events,
             againstInflight: "xyz abc",
             knownPrefix: "xyz ",
-            sessionID: "runtime-42"
+            sessionID: "runtime-42",
+            hasBoundaryAnchor: true
         )
         guard case .messageDelta(let sessionId, let text)? = result.first else {
             return XCTFail("Expected a merged delta")

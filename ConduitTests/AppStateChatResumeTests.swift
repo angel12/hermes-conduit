@@ -182,6 +182,47 @@ final class AppStateChatResumeTests: XCTestCase {
         XCTAssertEqual(harness.appState.streamingText, "I found it.")
     }
 
+    func testResumeDedupPreservesNoMarkerCollisionWithoutBoundaryText() async {
+        let openGate = ControlledSuspension()
+        let active = session("stored-a")
+        let harness = makeHarness(
+            lifecycleOperations: ChatResumeLifecycleOperations(
+                loadCatalog: { _, _ in [active] },
+                openSession: { _, sessionID in
+                    await openGate.suspend()
+                    return SessionResumeResult(
+                        sessionId: sessionID,
+                        messages: [],
+                        snapshot: SessionRuntimeSnapshot(
+                            object: [:],
+                            inflight: .object([
+                                "assistant": .string("xyz")
+                            ])
+                        )
+                    )
+                },
+                refreshContext: { _, _ in }
+            )
+        )
+        installComposerClient(in: harness)
+        harness.appState.sessions = [active]
+        harness.appState.activeSessionId = active.id
+
+        let refresh = Task { @MainActor in
+            await harness.appState.refreshActiveSession()
+        }
+        await openGate.waitUntilSuspended()
+        harness.appState.handleStreamEvent(
+            .messageDelta(sessionId: active.id, text: "xyz more")
+        )
+        openGate.resume()
+        await refresh.value
+
+        harness.appState.showSidebar = true
+        harness.appState.showSidebar = false
+        XCTAssertEqual(harness.appState.streamingText, "xyzxyz more")
+    }
+
     func testResumeDedupHandlesBoundaryLagWithInterleavedToolEvent() async {
         let openGate = ControlledSuspension()
         let active = session("stored-a")
