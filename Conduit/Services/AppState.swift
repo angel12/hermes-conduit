@@ -1661,6 +1661,7 @@ final class AppState: ObservableObject {
         let dashboardBaseURL = connection?.baseUrl
         connection = nil
         client = nil
+        dashboardTicketBridge?.invalidate()
         dashboardTicketBridge = nil
         voiceConversationController.stop()
         showVoiceSheet = false
@@ -1760,6 +1761,7 @@ final class AppState: ObservableObject {
         let normalized = baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let access = KeychainHelper.loadCloudflareAccess(for: normalized)
         if dashboardTicketBridge?.baseURL != normalized || dashboardTicketBridge?.cloudflareAccess != access {
+            dashboardTicketBridge?.invalidate()
             dashboardTicketBridge = DashboardTicketBridge(baseURL: normalized, cloudflareAccess: access)
         }
     }
@@ -1774,6 +1776,7 @@ final class AppState: ObservableObject {
         isConnecting = false
         connectedAt = nil
         connection = nil
+        dashboardTicketBridge?.invalidate()
         dashboardTicketBridge = nil
         projects = []
         supportsProjects = false

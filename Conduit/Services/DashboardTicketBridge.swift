@@ -152,6 +152,28 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
     }
 }
 
+final class DashboardTicketBridgePendingRequests {
+    typealias Continuation = CheckedContinuation<[String: Any], Error>
+
+    private var storage: [Int: Continuation] = [:]
+
+    var count: Int { storage.count }
+
+    func insert(_ continuation: Continuation, for id: Int) {
+        storage[id] = continuation
+    }
+
+    func removeValue(for id: Int) -> Continuation? {
+        storage.removeValue(forKey: id)
+    }
+
+    func rejectAll(with error: Error) {
+        let pending = storage
+        storage.removeAll()
+        pending.values.forEach { $0.resume(throwing: error) }
+    }
+}
+
 @MainActor
 final class DashboardTicketBridge: NSObject {
     let baseURL: String
@@ -159,8 +181,9 @@ final class DashboardTicketBridge: NSObject {
     let cloudflareAccess: CloudflareAccessCredentials?
 
     private var isReady = false
+    private var isInvalidated = false
     private var requestID = 0
-    private var pendingRequests: [Int: CheckedContinuation<[String: Any], Error>] = [:]
+    private let pendingRequests = DashboardTicketBridgePendingRequests()
 
     init(baseURL: String, cloudflareAccess: CloudflareAccessCredentials? = nil) {
         let normalizedBaseURL = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL)) ?? ""
@@ -184,31 +207,27 @@ final class DashboardTicketBridge: NSObject {
                 into: self.webView.configuration.websiteDataStore.httpCookieStore,
                 for: self.baseURL
             )
+            guard !self.isInvalidated else { return }
             self.loadDashboardSession()
         }
     }
 
     deinit {
-        // Defensive teardown. The retain-cycle fix is what makes bridge
-        // deallocation reachable at all. In practice this loop is a no-op
-        // today: a non-empty `pendingRequests` implies a `requestJSON`
-        // coroutine is suspended awaiting its continuation, and that
-        // suspended task retains `self`, so the bridge cannot deallocate
-        // until every request resolves and the dictionary drains. It is kept
-        // as a guard — if a future refactor breaks that invariant (e.g. the
-        // request task is detached, or continuations are stored somewhere
-        // `self` no longer keeps alive), resuming here is what stops callers
-        // from hanging on a reply the now-nil proxy would silently drop.
-        // Nothing else can resume these once the bridge is gone.
-        for continuation in pendingRequests.values {
-            continuation.resume(throwing: DashboardTicketBridgeError.notReady)
-        }
+        pendingRequests.rejectAll(with: DashboardTicketBridgeError.notReady)
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "dashboard-response")
     }
 
-    func reload() {
+    func invalidate() {
+        guard !isInvalidated else { return }
+        isInvalidated = true
         isReady = false
-        rejectPending(with: DashboardTicketBridgeError.notReady)
+        pendingRequests.rejectAll(with: DashboardTicketBridgeError.notReady)
+    }
+
+    func reload() {
+        guard !isInvalidated else { return }
+        isReady = false
+        pendingRequests.rejectAll(with: DashboardTicketBridgeError.notReady)
         Task { [weak self] in
             guard let self else { return }
             await DashboardCookiePersistence.restore(into: self.webView.configuration.websiteDataStore.httpCookieStore)
@@ -216,6 +235,7 @@ final class DashboardTicketBridge: NSObject {
                 into: self.webView.configuration.websiteDataStore.httpCookieStore,
                 for: self.baseURL
             )
+            guard !self.isInvalidated else { return }
             self.loadDashboardSession()
         }
     }
@@ -241,10 +261,10 @@ final class DashboardTicketBridge: NSObject {
     }
 
     private func waitUntilReady() async throws {
-        for _ in 0..<30 where !isReady {
+        for _ in 0..<30 where !isReady && !isInvalidated {
             try await Task.sleep(for: .milliseconds(100))
         }
-        guard isReady else { throw DashboardTicketBridgeError.notReady }
+        guard !isInvalidated, isReady else { throw DashboardTicketBridgeError.notReady }
     }
 
     /// Requests authenticated dashboard JSON through the same WebKit cookie
@@ -257,10 +277,10 @@ final class DashboardTicketBridge: NSObject {
         timeoutMilliseconds: Int = 12_000,
         maxResponseBytes: Int = DataURLLimits.maxJSONResponseBytes
     ) async throws -> [String: Any] {
-        for _ in 0..<30 where !isReady {
+        for _ in 0..<30 where !isReady && !isInvalidated {
             try await Task.sleep(for: .milliseconds(100))
         }
-        guard isReady else { throw DashboardTicketBridgeError.notReady }
+        guard !isInvalidated, isReady else { throw DashboardTicketBridgeError.notReady }
 
         requestID += 1
         let id = requestID
@@ -277,7 +297,7 @@ final class DashboardTicketBridge: NSObject {
                     return
                 }
 
-                pendingRequests[id] = continuation
+                pendingRequests.insert(continuation, for: id)
                 let script = """
                 (async function() {
                     try {
@@ -337,7 +357,7 @@ final class DashboardTicketBridge: NSObject {
                 true;
                 """
                 webView.evaluateJavaScript(script) { _, error in
-                    guard let error, let pending = self.pendingRequests.removeValue(forKey: id) else { return }
+                    guard let error, let pending = self.pendingRequests.removeValue(for: id) else { return }
                     pending.resume(throwing: error)
                 }
             }
@@ -349,7 +369,7 @@ final class DashboardTicketBridge: NSObject {
     }
 
     private func cancelPendingRequest(id: Int) {
-        guard let continuation = pendingRequests.removeValue(forKey: id) else { return }
+        guard let continuation = pendingRequests.removeValue(for: id) else { return }
         continuation.resume(throwing: CancellationError())
     }
 
@@ -370,9 +390,7 @@ final class DashboardTicketBridge: NSObject {
     }
 
     private func rejectPending(with error: Error) {
-        let pending = pendingRequests
-        pendingRequests.removeAll()
-        pending.values.forEach { $0.resume(throwing: error) }
+        pendingRequests.rejectAll(with: error)
     }
 }
 
@@ -446,7 +464,7 @@ extension DashboardTicketBridge: WKScriptMessageHandler {
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               payload["type"] as? String == "dashboard-response",
               let id = payload["id"] as? Int,
-              let continuation = pendingRequests.removeValue(forKey: id) else { return }
+              let continuation = pendingRequests.removeValue(for: id) else { return }
 
         if payload["ok"] as? Bool == true {
             continuation.resume(returning: payload["body"] as? [String: Any] ?? [:])
