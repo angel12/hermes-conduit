@@ -299,12 +299,75 @@ private struct PendingRequest {
     let timer: Timer?
 }
 
+// MARK: - WebSocket seam
+
+/// The slice of `URLSessionWebSocketTask` that `HermesClient` depends on, so
+/// the client can be driven against a fake transport in tests without a real
+/// network. `AnyObject`-bound so the `===` identity checks (which tell a
+/// superseded receive loop apart from the current socket) keep working on the
+/// existential type.
+protocol HermesWebSocket: AnyObject {
+    var closeCode: URLSessionWebSocketTask.CloseCode { get }
+    func resume()
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
+    func receive() async throws -> URLSessionWebSocketTask.Message
+    func send(_ message: URLSessionWebSocketTask.Message, completionHandler: @escaping @Sendable (Error?) -> Void)
+}
+
+extension URLSessionWebSocketTask: HermesWebSocket {}
+
+/// Produces sockets for a `HermesClient` and owns the underlying session.
+/// `makeSocket` wires the handshake callbacks (`onOpen` / `onCloseBeforeOpen`,
+/// mirroring `URLSessionWebSocketDelegate`); `invalidate` tears the session
+/// down. The production impl is a faithful extraction of the client's former
+/// inline `URLSession` logic; tests supply a fake. All methods are invoked from
+/// `HermesClient` on the MainActor; the protocol is left nonisolated so the
+/// `URLSessionWebSocketTransport` default doesn't force closure-isolation hoops.
+protocol HermesWebSocketTransport: AnyObject {
+    func makeSocket(
+        request: URLRequest,
+        onOpen: @escaping (any HermesWebSocket) -> Void,
+        onCloseBeforeOpen: @escaping (any HermesWebSocket) -> Void
+    ) -> any HermesWebSocket
+
+    func invalidate()
+}
+
+/// Production transport: one `URLSession` per socket, delegate-driven
+/// handshake. Behaviour is identical to the client's pre-seam connect().
+final class URLSessionWebSocketTransport: HermesWebSocketTransport {
+    private var session: URLSession?
+    private var delegate: WebSocketOpenDelegate?
+
+    func makeSocket(
+        request: URLRequest,
+        onOpen: @escaping (any HermesWebSocket) -> Void,
+        onCloseBeforeOpen: @escaping (any HermesWebSocket) -> Void
+    ) -> any HermesWebSocket {
+        let delegate = WebSocketOpenDelegate()
+        delegate.onOpen = onOpen
+        delegate.onCloseBeforeOpen = onCloseBeforeOpen
+        let config = URLSessionConfiguration.default
+        config.waitsForConnectivity = true
+        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+        self.session = session
+        self.delegate = delegate
+        return session.webSocketTask(with: request)
+    }
+
+    func invalidate() {
+        session?.invalidateAndCancel()
+        session = nil
+        delegate = nil
+    }
+}
+
 /// URLSession only confirms the WebSocket handshake through its delegate. The
 /// client must not issue session RPCs or paint a green indicator before this
 /// callback, otherwise a just-opened socket can race its first `session.resume`.
 private final class WebSocketOpenDelegate: NSObject, URLSessionWebSocketDelegate {
-    var onOpen: ((URLSessionWebSocketTask) -> Void)?
-    var onCloseBeforeOpen: ((URLSessionWebSocketTask) -> Void)?
+    var onOpen: ((any HermesWebSocket) -> Void)?
+    var onCloseBeforeOpen: ((any HermesWebSocket) -> Void)?
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
         onOpen?(webSocketTask)
@@ -326,9 +389,9 @@ final class HermesClient: ObservableObject {
     @Published private(set) var isConnected = false
 
     // Non-published internal state
-    private var socket: URLSessionWebSocketTask?
-    private var session: URLSession?
-    private var socketDelegate: WebSocketOpenDelegate?
+    private var socket: (any HermesWebSocket)?
+    private var transport: (any HermesWebSocketTransport)?
+    private let transportFactory: () -> any HermesWebSocketTransport
     private var requestId = 0
     private var pending = [Int: PendingRequest]()
     private var closedIntentionally = false
@@ -349,15 +412,47 @@ final class HermesClient: ObservableObject {
     static let promptSubmitTimeout: TimeInterval = 180 // 3 minutes
     static let titleGenerationTimeout: TimeInterval = 90
 
-    init(connection: HermesConnection, profile: String? = nil, cloudflareAccess: CloudflareAccessCredentials? = nil) {
+    init(
+        connection: HermesConnection,
+        profile: String? = nil,
+        cloudflareAccess: CloudflareAccessCredentials? = nil,
+        transportFactory: @escaping () -> any HermesWebSocketTransport = { URLSessionWebSocketTransport() }
+    ) {
         self.connection = connection
         self.profile = profile
         self.cloudflareAccess = cloudflareAccess
+        self.transportFactory = transportFactory
     }
 
     // MARK: - Connection
 
     func connect() async throws {
+        // Tear down any prior connection in full before installing a new one —
+        // this mirrors disconnect()'s cleanup. Cancelling the receive task alone
+        // is not enough: URLSessionWebSocketTask.receive() does not honor
+        // cooperative cancellation, so a superseded loop stays alive until its
+        // socket actually errors; cancelling the socket + invalidating the
+        // session forces that error, after which the loop's identity guard
+        // no-ops its late catch. Resuming the open continuation and failing
+        // pending RPCs here also covers the case where the new connect() throws
+        // before its own waitForSocketOpen (e.g. invalid URL) — without it the
+        // prior connect() would hang forever and its RPCs would wait out their
+        // own timers. (AppState makes a fresh HermesClient per reconnect and
+        // disconnects the old one first, so this is defense-in-depth against an
+        // intra-instance reconnect — which no caller does today.)
+        receiveTask?.cancel()
+        receiveTask = nil
+        socket?.cancel(with: .goingAway, reason: nil)
+        socket = nil
+        transport?.invalidate()
+        transport = nil
+        openTimeoutTask?.cancel()
+        openTimeoutTask = nil
+        openContinuation?.resume(throwing: HermesError.connectionClosed)
+        openContinuation = nil
+        isConnected = false
+        failAllPendingRequests(with: HermesError.connectionClosed)
+
         closedIntentionally = false
         socketHasOpened = false
         let url: URL
@@ -371,22 +466,16 @@ final class HermesClient: ObservableObject {
             throw HermesError.invalidUrl
         }
 
-        let config = URLSessionConfiguration.default
-        config.waitsForConnectivity = true
-        let socketDelegate = WebSocketOpenDelegate()
-        socketDelegate.onOpen = { [weak self] task in
-            Task { @MainActor in self?.didOpen(task) }
-        }
-        socketDelegate.onCloseBeforeOpen = { [weak self] task in
-            Task { @MainActor in self?.didClose(task) }
-        }
-        let session = URLSession(configuration: config, delegate: socketDelegate, delegateQueue: nil)
-        self.session = session
-        self.socketDelegate = socketDelegate
+        let transport = transportFactory()
+        self.transport = transport
 
         var request = URLRequest(url: url)
         request = cloudflareAccess?.applying(to: request) ?? request
-        let socket = session.webSocketTask(with: request)
+        let socket = transport.makeSocket(
+            request: request,
+            onOpen: { [weak self] socket in Task { @MainActor in self?.didOpen(socket) } },
+            onCloseBeforeOpen: { [weak self] socket in Task { @MainActor in self?.didClose(socket) } }
+        )
         self.socket = socket
         socket.resume()
         try await waitForSocketOpen(socket)
@@ -399,7 +488,9 @@ final class HermesClient: ObservableObject {
         }
     }
 
-    private func waitForSocketOpen(_ socket: URLSessionWebSocketTask) async throws {
+    private func waitForSocketOpen(_ socket: any HermesWebSocket) async throws {
+        // The prior continuation (if any) is already resumed by connect()'s
+        // teardown before we reach here, so just install this one.
         try await withCheckedThrowingContinuation { continuation in
             openContinuation = continuation
             openTimeoutTask?.cancel()
@@ -411,7 +502,7 @@ final class HermesClient: ObservableObject {
         }
     }
 
-    private func didOpen(_ socket: URLSessionWebSocketTask) {
+    private func didOpen(_ socket: any HermesWebSocket) {
         guard self.socket === socket, !socketHasOpened else { return }
         socketHasOpened = true
         openTimeoutTask?.cancel()
@@ -420,17 +511,20 @@ final class HermesClient: ObservableObject {
         openContinuation = nil
     }
 
-    private func didClose(_ socket: URLSessionWebSocketTask) {
+    private func didClose(_ socket: any HermesWebSocket) {
         guard self.socket === socket, !socketHasOpened else { return }
         failSocketOpen(socket, error: HermesError.connectionClosed)
     }
 
-    private func failSocketOpen(_ socket: URLSessionWebSocketTask, error: Error) {
+    private func failSocketOpen(_ socket: any HermesWebSocket, error: Error) {
         guard self.socket === socket else { return }
         openTimeoutTask?.cancel()
         openTimeoutTask = nil
         socket.cancel(with: .goingAway, reason: nil)
         self.socket = nil
+        transport?.invalidate()
+        transport = nil
+        isConnected = false
         openContinuation?.resume(throwing: error)
         openContinuation = nil
     }
@@ -441,6 +535,12 @@ final class HermesClient: ObservableObject {
         while !Task.isCancelled {
             do {
                 let message = try await socket.receive()
+                // A reconnect replaces `self.socket`; if this loop has been
+                // superseded, drop the frame rather than dispatch it —
+                // `handleMessage` has no identity check of its own and could
+                // otherwise fire `onEvent`/resolve pending RPCs for the new
+                // connection. Same guard the catch uses below.
+                guard self.socket === socket else { break }
                 switch message {
                 case .data(let data):
                     handleMessage(data: data)
@@ -452,11 +552,21 @@ final class HermesClient: ObservableObject {
             } catch {
                 // Socket closed or errored
                 logger.error("WebSocket receive failed: \(error.localizedDescription, privacy: .public)")
+                // Only tear down if this loop still owns the current socket.
+                // A reconnect replaces `self.socket` and spawns a new loop; an
+                // unguarded late catch from the superseded loop would mark the
+                // healthy new connection disconnected and fail its in-flight
+                // RPCs. didOpen/didClose/failSocketOpen guard the same way.
+                guard self.socket === socket else { break }
                 isConnected = false
                 // No response can ever arrive on a dead socket; failing the
                 // in-flight requests here keeps awaiting UI from hanging for
                 // the remainder of each request's timeout.
                 failAllPendingRequests(with: HermesError.connectionClosed)
+                // Drop the dead socket: its `closeCode` stays `.invalid` after
+                // a receive error, so leaving it installed would let `rpc`
+                // re-issue against it and hang until its own timeout.
+                self.socket = nil
                 if !closedIntentionally {
                     onDisconnected?()
                 }
@@ -504,14 +614,15 @@ final class HermesClient: ObservableObject {
     func disconnect() {
         closedIntentionally = true
         receiveTask?.cancel()
+        receiveTask = nil
         openTimeoutTask?.cancel()
         openTimeoutTask = nil
         openContinuation?.resume(throwing: HermesError.connectionClosed)
         openContinuation = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
-        session?.invalidateAndCancel()
-        socketDelegate = nil
+        transport?.invalidate()
+        transport = nil
         isConnected = false
         failAllPendingRequests(with: HermesError.connectionClosed)
     }
@@ -527,7 +638,10 @@ final class HermesClient: ObservableObject {
     // MARK: - RPC
 
     private func rpc(_ method: String, params: [String: Any]? = nil, timeout: TimeInterval = requestTimeout) async throws -> AnyCodable {
-        guard let socket, socket.closeCode == .invalid else {
+        // Require both a live socket and a completed handshake. A receive
+        // error leaves the socket installed with `closeCode == .invalid`, so
+        // closeCode alone would let an RPC ride a dead socket to its timeout.
+        guard let socket, socket.closeCode == .invalid, isConnected else {
             throw HermesError.notConnected
         }
 
