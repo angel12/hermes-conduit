@@ -864,6 +864,106 @@ private struct RemoteMarkdownImage: View {
     }
 }
 
+/// Resolves a model-authored image destination without treating a non-nil URL
+/// as proof that it is a usable web destination. Strict parsing preserves
+/// existing percent escapes; component-aware repair handles spaces and other
+/// invalid characters without encoding URL delimiters or double-encoding `%XX`.
+enum WebFallbackImageDestination {
+    static func resolve(_ value: String) -> URL? {
+        if let strictURL = URL(string: value, encodingInvalidCharacters: false),
+           isValidWebDestination(strictURL) {
+            return strictURL
+        }
+
+        guard var components = URLComponents(string: value),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = components.host,
+              !host.isEmpty,
+              let encodedPath = encodedComponent(
+                  components.path,
+                  allowedCharacters: .urlPathAllowed
+              ) else {
+            return nil
+        }
+
+        components.scheme = scheme
+        components.percentEncodedPath = encodedPath
+        if let query = components.query {
+            guard let encodedQuery = encodedComponent(
+                query,
+                allowedCharacters: .urlQueryAllowed
+            ) else { return nil }
+            components.percentEncodedQuery = encodedQuery
+        } else {
+            components.percentEncodedQuery = nil
+        }
+        if let fragment = components.fragment {
+            guard let encodedFragment = encodedComponent(
+                fragment,
+                allowedCharacters: .urlFragmentAllowed
+            ) else { return nil }
+            components.percentEncodedFragment = encodedFragment
+        } else {
+            components.percentEncodedFragment = nil
+        }
+
+        return isValidWebDestination(components.url) ? components.url : nil
+    }
+
+    private static func isValidWebDestination(_ url: URL?) -> Bool {
+        guard let url,
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host,
+              !host.isEmpty else { return false }
+        return true
+    }
+
+    private static func encodedComponent(
+        _ value: String,
+        allowedCharacters: CharacterSet
+    ) -> String? {
+        var allowed = allowedCharacters
+        allowed.insert(charactersIn: "%")
+        return escapedStrayPercents(in: value)
+            .addingPercentEncoding(withAllowedCharacters: allowed)
+    }
+
+    private static func escapedStrayPercents(in value: String) -> String {
+        let bytes = Array(value.utf8)
+        var escaped: [UInt8] = []
+        escaped.reserveCapacity(bytes.count)
+        var index = 0
+
+        while index < bytes.count {
+            guard bytes[index] == 37 else {
+                escaped.append(bytes[index])
+                index += 1
+                continue
+            }
+
+            if index + 2 < bytes.count,
+               isHexDigit(bytes[index + 1]),
+               isHexDigit(bytes[index + 2]) {
+                escaped.append(contentsOf: bytes[index...(index + 2)])
+                index += 3
+            } else {
+                escaped.append(contentsOf: [37, 50, 53])
+                index += 1
+            }
+        }
+
+        return String(decoding: escaped, as: UTF8.self)
+    }
+
+    private static func isHexDigit(_ byte: UInt8) -> Bool {
+        (byte >= 48 && byte <= 57)
+            || (byte >= 65 && byte <= 70)
+            || (byte >= 97 && byte <= 102)
+    }
+}
+
 /// AsyncImage is fast for ordinary HTTPS hosts. Some image CDNs reject its
 /// URLSession user agent or redirect to HTTP; WebKit follows the same browser
 /// path as the source link, but is isolated to this image-only fallback.
@@ -902,7 +1002,7 @@ private struct WebFallbackImage: View {
 
     @ViewBuilder
     private var fallbackLabel: some View {
-        if let destination = URL(string: url) ?? URL(string: url.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "") {
+        if let destination = WebFallbackImageDestination.resolve(url) {
             Link(destination: destination) {
                 Label(
                     WebFallbackImageLabel.title(alt: alt, destinationAvailable: true),
