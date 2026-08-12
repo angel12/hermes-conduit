@@ -2311,16 +2311,37 @@ final class AppState: ObservableObject {
                 : []
             if result.snapshot.hasLiveProjection {
                 let resumedInflightText = streamingBuffer
+                let boundary = reconciliation?.token == token ? reconciliation : nil
+                let acceptedSessionIDs: Set<String>
+                if let boundary,
+                   let boundarySessionID = boundary.streamSessionIDAtBoundary {
+                    acceptedSessionIDs = boundary.acceptedSessionIDs.intersection(
+                        knownSessionIDs(for: boundarySessionID)
+                    )
+                } else {
+                    acceptedSessionIDs = [result.sessionId]
+                }
                 let knownPrefix: String?
-                if let boundary = reconciliation, boundary.token == token {
+                let coveredText: String?
+                if let boundary {
                     knownPrefix = Self.normalizedReconciliationBoundaryPrefix(
                         boundaryText: boundary.streamTextAtBoundary,
                         boundarySessionID: boundary.streamSessionIDAtBoundary,
                         resumedSessionID: result.sessionId,
+                        acceptedSessionIDs: acceptedSessionIDs,
+                        after: messages
+                    )
+                    coveredText = Self.reconciliationBoundaryCoverageText(
+                        boundaryText: boundary.streamTextAtBoundary,
+                        boundarySessionID: boundary.streamSessionIDAtBoundary,
+                        resumedSessionID: result.sessionId,
+                        acceptedSessionIDs: acceptedSessionIDs,
+                        snapshotInflightText: result.snapshot.inflightAssistantText,
                         after: messages
                     )
                 } else {
                     knownPrefix = nil
+                    coveredText = nil
                 }
 
                 // The live bubble was just seeded from the cumulative inflight
@@ -2331,7 +2352,9 @@ final class AppState: ObservableObject {
                     bufferedEvents,
                     againstInflight: resumedInflightText,
                     knownPrefix: knownPrefix,
-                    sessionID: result.sessionId
+                    sessionID: result.sessionId,
+                    acceptedSessionIDs: acceptedSessionIDs,
+                    coveredText: coveredText
                 )
             }
             bufferedEvents.forEach(applyStreamEvent)
@@ -2698,34 +2721,85 @@ final class AppState: ObservableObject {
         boundaryText: String?,
         boundarySessionID: String?,
         resumedSessionID: String,
+        acceptedSessionIDs: Set<String>,
         after messages: [ChatMessage]
     ) -> String? {
         guard let boundaryText,
               let boundarySessionID,
               !boundarySessionID.isEmpty,
-              boundarySessionID == resumedSessionID else {
+              acceptedSessionIDs.contains(boundarySessionID),
+              acceptedSessionIDs.contains(resumedSessionID) else {
             return nil
         }
         return unpersistedInflightAssistantText(boundaryText, after: messages)
+    }
+
+    nonisolated static func reconciliationBoundaryCoverageText(
+        boundaryText: String?,
+        boundarySessionID: String?,
+        resumedSessionID: String,
+        acceptedSessionIDs: Set<String>,
+        snapshotInflightText: String,
+        after messages: [ChatMessage]
+    ) -> String? {
+        guard let boundaryText,
+              let boundarySessionID,
+              !boundarySessionID.isEmpty,
+              acceptedSessionIDs.contains(boundarySessionID),
+              acceptedSessionIDs.contains(resumedSessionID) else {
+            return nil
+        }
+
+        let normalizedBoundaryText = boundaryText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedSnapshotText = snapshotInflightText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalizedSnapshotText.hasPrefix(normalizedBoundaryText) {
+            return String(normalizedSnapshotText.dropFirst(normalizedBoundaryText.count))
+        }
+
+        let normalizedUnpersistedBoundary = unpersistedInflightAssistantText(
+            boundaryText,
+            after: messages
+        )
+        let normalizedUnpersistedSnapshot = unpersistedInflightAssistantText(
+            snapshotInflightText,
+            after: messages
+        )
+        guard normalizedUnpersistedSnapshot.hasPrefix(normalizedUnpersistedBoundary) else {
+            return nil
+        }
+        return String(
+            normalizedUnpersistedSnapshot.dropFirst(normalizedUnpersistedBoundary.count)
+        )
     }
 
     nonisolated static func deduplicatingBufferedEvents(
         _ events: [StreamEvent],
         againstInflight inflight: String,
         knownPrefix: String?,
-        sessionID: String
+        sessionID: String,
+        acceptedSessionIDs: Set<String> = [],
+        coveredText explicitCoveredText: String? = nil
     ) -> [StreamEvent] {
-        let normalizedInflight = inflight.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalizedKnownPrefix = knownPrefix?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let normalizedKnownPrefix,
-              normalizedInflight.hasPrefix(normalizedKnownPrefix) else {
-            return events
+        let coveredText: String
+        if let explicitCoveredText {
+            coveredText = explicitCoveredText
+        } else {
+            guard let knownPrefix else { return events }
+            if inflight.hasPrefix(knownPrefix) {
+                coveredText = String(inflight.dropFirst(knownPrefix.count))
+            } else {
+                let normalizedInflight = inflight.trimmingCharacters(in: .whitespacesAndNewlines)
+                let normalizedKnownPrefix = knownPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard normalizedInflight.hasPrefix(normalizedKnownPrefix) else {
+                    return events
+                }
+                coveredText = String(
+                    normalizedInflight.dropFirst(normalizedKnownPrefix.count)
+                )
+            }
         }
-
-        let coveredText = String(
-            normalizedInflight.dropFirst(normalizedKnownPrefix.count)
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !coveredText.isEmpty else { return events }
+        let normalizedCoveredText = coveredText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedCoveredText.isEmpty else { return events }
 
         let bufferedDeltaTexts = events.compactMap { event in
             if case .messageDelta(_, let text) = event {
@@ -2741,8 +2815,12 @@ final class AppState: ObservableObject {
             }
             return nil
         })
+        let allowedSessionIDs = acceptedSessionIDs.isEmpty
+            ? Set([sessionID])
+            : acceptedSessionIDs
         guard deltaSessionIDs.count == 1,
-              deltaSessionIDs.first == sessionID else {
+              let deltaSessionID = deltaSessionIDs.first,
+              allowedSessionIDs.contains(deltaSessionID) else {
             return events
         }
 
@@ -2751,12 +2829,20 @@ final class AppState: ObservableObject {
         guard !normalizedBufferedDeltaText.isEmpty else { return events }
 
         let coveredRawCharacters: Int
-        if normalizedBufferedDeltaText == coveredText {
+        if normalizedBufferedDeltaText == normalizedCoveredText {
             coveredRawCharacters = bufferedDeltaText.count
-        } else if normalizedBufferedDeltaText.hasPrefix(coveredText) {
+        } else if normalizedBufferedDeltaText.hasPrefix(normalizedCoveredText) {
             let leadingWhitespaceCount = bufferedDeltaText.prefix { $0.isWhitespace }.count
-            coveredRawCharacters = leadingWhitespaceCount + coveredText.count
-        } else if coveredText.hasPrefix(normalizedBufferedDeltaText) {
+            let coveredEnd = leadingWhitespaceCount + normalizedCoveredText.count
+            let coveredTrailingWhitespaceCount = coveredText.reversed().prefix { $0.isWhitespace }.count
+            let bufferedTrailingWhitespaceCount = bufferedDeltaText.dropFirst(coveredEnd)
+                .prefix { $0.isWhitespace }
+                .count
+            coveredRawCharacters = coveredEnd + min(
+                coveredTrailingWhitespaceCount,
+                bufferedTrailingWhitespaceCount
+            )
+        } else if normalizedCoveredText.hasPrefix(normalizedBufferedDeltaText) {
             coveredRawCharacters = bufferedDeltaText.count
         } else {
             return events

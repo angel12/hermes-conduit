@@ -182,6 +182,137 @@ final class AppStateChatResumeTests: XCTestCase {
         XCTAssertEqual(harness.appState.streamingText, "I found it.")
     }
 
+    func testResumeDedupHandlesBoundaryLagWithInterleavedToolEvent() async {
+        let openGate = ControlledSuspension()
+        let active = session("stored-a")
+        let persistedText = "The quick brown"
+        let harness = makeHarness(
+            lifecycleOperations: ChatResumeLifecycleOperations(
+                loadCatalog: { _, _ in [active] },
+                openSession: { _, sessionID in
+                    await openGate.suspend()
+                    return SessionResumeResult(
+                        sessionId: sessionID,
+                        messages: [
+                            ChatMessage(
+                                id: "persisted-assistant",
+                                role: .assistant,
+                                content: persistedText,
+                                timestamp: "1"
+                            )
+                        ],
+                        snapshot: SessionRuntimeSnapshot(
+                            object: [:],
+                            inflight: .object([
+                                "assistant": .string("The quick brown fox")
+                            ])
+                        )
+                    )
+                },
+                refreshContext: { _, _ in }
+            )
+        )
+        installComposerClient(in: harness)
+        harness.appState.sessions = [active]
+        harness.appState.activeSessionId = active.id
+        harness.appState.messages = [
+            ChatMessage(
+                id: "persisted-assistant",
+                role: .assistant,
+                content: persistedText,
+                timestamp: "1"
+            )
+        ]
+        harness.appState.handleStreamEvent(
+            .messageDelta(sessionId: active.id, text: "The quick")
+        )
+
+        let refresh = Task { @MainActor in
+            await harness.appState.refreshActiveSession()
+        }
+        await openGate.waitUntilSuspended()
+        harness.appState.handleStreamEvent(
+            .messageDelta(sessionId: active.id, text: " brown fox jumps")
+        )
+        harness.appState.handleStreamEvent(
+            .toolStart(sessionId: active.id, toolName: "Bash", toolInput: "ls")
+        )
+        harness.appState.handleStreamEvent(
+            .messageDelta(sessionId: active.id, text: " now")
+        )
+        openGate.resume()
+        await refresh.value
+
+        harness.appState.showSidebar = true
+        harness.appState.showSidebar = false
+        let partials = harness.appState.messages.filter { $0.role == .partial }
+        let toolIndex = harness.appState.messages.firstIndex { $0.role == .tool }
+        let partialIndex = harness.appState.messages.firstIndex { $0.role == .partial }
+        XCTAssertEqual(partials.map(\.content), ["fox jumps"])
+        XCTAssertEqual(toolIndex, partialIndex.map { $0 + 1 })
+        XCTAssertEqual(harness.appState.streamingText, " now")
+    }
+
+    func testResumeDedupAcceptsAlternateSessionIDForBufferedDelta() async {
+        let openGate = ControlledSuspension()
+        let active = session("stored-a", alternateIDs: ["runtime-a"])
+        let persistedText = "Let me find the transcript."
+        let harness = makeHarness(
+            lifecycleOperations: ChatResumeLifecycleOperations(
+                loadCatalog: { _, _ in [active] },
+                openSession: { _, _ in
+                    await openGate.suspend()
+                    return SessionResumeResult(
+                        sessionId: "runtime-a",
+                        messages: [
+                            ChatMessage(
+                                id: "persisted-assistant",
+                                role: .assistant,
+                                content: persistedText,
+                                timestamp: "1"
+                            )
+                        ],
+                        snapshot: SessionRuntimeSnapshot(
+                            object: [:],
+                            inflight: .object([
+                                "assistant": .string("\(persistedText) I found it.")
+                            ])
+                        )
+                    )
+                },
+                refreshContext: { _, _ in }
+            )
+        )
+        installComposerClient(in: harness)
+        harness.appState.sessions = [active]
+        harness.appState.activeSessionId = active.id
+        harness.appState.messages = [
+            ChatMessage(
+                id: "persisted-assistant",
+                role: .assistant,
+                content: persistedText,
+                timestamp: "1"
+            )
+        ]
+        harness.appState.handleStreamEvent(
+            .messageDelta(sessionId: active.id, text: persistedText)
+        )
+
+        let refresh = Task { @MainActor in
+            await harness.appState.refreshActiveSession()
+        }
+        await openGate.waitUntilSuspended()
+        harness.appState.handleStreamEvent(
+            .messageDelta(sessionId: "runtime-a", text: " I found it.")
+        )
+        openGate.resume()
+        await refresh.value
+
+        harness.appState.showSidebar = true
+        harness.appState.showSidebar = false
+        XCTAssertEqual(harness.appState.streamingText, "I found it.")
+    }
+
     func testResumeDoesNotUsePreviousSessionBoundaryForNewSessionDelta() async {
         let contextGate = ControlledSuspension()
         let previous = session("stored-old")

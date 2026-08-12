@@ -178,6 +178,21 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         XCTAssertTrue(result.isEmpty)
     }
 
+    func testCoveredTrailingWhitespaceIsNotReplayedBeforeNewText() {
+        let events: [StreamEvent] = [
+            .messageDelta(sessionId: "s1", text: "foo bar"),
+        ]
+
+        let result = AppState.deduplicatingBufferedEvents(
+            events,
+            againstInflight: "foo ",
+            knownPrefix: "",
+            sessionID: "s1"
+        )
+
+        XCTAssertEqual(deltaTexts(in: result), ["bar"])
+    }
+
     func testMissingBoundaryDoesNotGuessFromText() {
         let events: [StreamEvent] = [
             .messageDelta(sessionId: "s1", text: "aaa"),
