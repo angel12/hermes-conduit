@@ -288,6 +288,77 @@ final class BufferedEventDeduplicationTests: XCTestCase {
         XCTAssertEqual(deltaTexts(in: result), ["bcabc"])
     }
 
+    func testNewTurnMarkerPreservesCoincidentallyRepeatedText() {
+        let events: [StreamEvent] = [
+            .messageStart(sessionId: "s1"),
+            .messageDelta(sessionId: "s1", text: "xyz more"),
+        ]
+
+        let result = AppState.deduplicatingBufferedEvents(
+            events,
+            againstInflight: "xyz",
+            knownPrefix: "",
+            sessionID: "s1",
+            coveredText: "xyz"
+        )
+
+        XCTAssertEqual(deltaTexts(in: result), ["xyz more"])
+    }
+
+    func testNewTurnMarkerOnlyPreservesEventsAfterTheMarker() {
+        let events: [StreamEvent] = [
+            .messageDelta(sessionId: "s1", text: "old"),
+            .messageStart(sessionId: "s1"),
+            .messageDelta(sessionId: "s1", text: "xyz more"),
+        ]
+
+        let result = AppState.deduplicatingBufferedEvents(
+            events,
+            againstInflight: "old",
+            knownPrefix: "",
+            sessionID: "s1",
+            coveredText: "old"
+        )
+
+        XCTAssertEqual(deltaTexts(in: result), ["xyz more"])
+        XCTAssertEqual(result.count, 2)
+        if case .messageStart = result[0] {} else {
+            XCTFail("Expected the new-turn marker to remain before its delta")
+        }
+    }
+
+    func testExplicitCoverageMustMatchSeededInflightBeforeDeduplicating() {
+        let events: [StreamEvent] = [
+            .messageDelta(sessionId: "s1", text: "covered"),
+        ]
+
+        let result = AppState.deduplicatingBufferedEvents(
+            events,
+            againstInflight: "unrelated",
+            knownPrefix: "boundary",
+            sessionID: "s1",
+            coveredText: "covered"
+        )
+
+        XCTAssertEqual(deltaTexts(in: result), ["covered"])
+    }
+
+    func testExplicitCoverageMustOverlapSeededInflightBeforeDeduplicating() {
+        let events: [StreamEvent] = [
+            .messageDelta(sessionId: "s1", text: "coincidental"),
+        ]
+
+        let result = AppState.deduplicatingBufferedEvents(
+            events,
+            againstInflight: "seeded",
+            knownPrefix: "",
+            sessionID: "s1",
+            coveredText: "coincidental"
+        )
+
+        XCTAssertEqual(deltaTexts(in: result), ["coincidental"])
+    }
+
     func testMissingBoundaryDoesNotGuessFromText() {
         let events: [StreamEvent] = [
             .messageDelta(sessionId: "s1", text: "aaa"),

@@ -2795,6 +2795,25 @@ final class AppState: ObservableObject {
     ) -> [StreamEvent] {
         let coveredText: String
         if let explicitCoveredText {
+            guard let knownPrefix else { return events }
+            let normalizedInflight = inflight.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedKnownPrefix = knownPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard normalizedInflight.hasPrefix(normalizedKnownPrefix) else {
+                return events
+            }
+            let expectedCoveredText = String(
+                normalizedInflight.dropFirst(normalizedKnownPrefix.count)
+            )
+            let normalizedExplicitCoveredText = explicitCoveredText
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let explicitCoverageOverlapsSeededText = Self.suffixPrefixOverlapLengths(
+                covered: normalizedExplicitCoveredText,
+                buffered: expectedCoveredText
+            )
+            guard !expectedCoveredText.isEmpty,
+                  explicitCoverageOverlapsSeededText.count == 1 else {
+                return events
+            }
             coveredText = explicitCoveredText
         } else {
             guard let knownPrefix else { return events }
@@ -2835,6 +2854,26 @@ final class AppState: ObservableObject {
               let deltaSessionID = deltaSessionIDs.first,
               allowedSessionIDs.contains(deltaSessionID) else {
             return events
+        }
+
+        if let newTurnIndex = events.firstIndex(where: { event in
+            guard case .messageStart(let startSessionID) = event else { return false }
+            return allowedSessionIDs.contains(startSessionID)
+        }) {
+            // A message start observed after the reconciliation boundary is
+            // an explicit new-turn marker. Deduplicate any older buffered
+            // events, but preserve the marker and everything after it because
+            // the same text can be fresh content from the new turn.
+            let eventsBeforeNewTurn = Array(events[..<newTurnIndex])
+            let eventsAfterNewTurn = Array(events[newTurnIndex...])
+            return deduplicatingBufferedEvents(
+                eventsBeforeNewTurn,
+                againstInflight: inflight,
+                knownPrefix: knownPrefix,
+                sessionID: sessionID,
+                acceptedSessionIDs: acceptedSessionIDs,
+                coveredText: explicitCoveredText
+            ) + eventsAfterNewTurn
         }
 
         let bufferedDeltaText = bufferedDeltaTexts.joined()
