@@ -407,6 +407,8 @@ final class AppState: ObservableObject {
         var resolvedSessionId: String?
         var acceptedSessionIDs: Set<String>
         let acceptsAnySession: Bool
+        let streamTextAtBoundary: String?
+        let streamSessionIDAtBoundary: String?
         var bufferedEvents: [StreamEvent] = []
 
         init(
@@ -415,6 +417,8 @@ final class AppState: ObservableObject {
             automaticSyncOperationID: UUID? = nil,
             acceptedSessionIDs: Set<String> = [],
             acceptsAnySession: Bool = false,
+            streamTextAtBoundary: String? = nil,
+            streamSessionIDAtBoundary: String? = nil,
             bufferedEvents: [StreamEvent] = []
         ) {
             self.token = token
@@ -422,6 +426,8 @@ final class AppState: ObservableObject {
             self.automaticSyncOperationID = automaticSyncOperationID
             self.acceptedSessionIDs = acceptedSessionIDs
             self.acceptsAnySession = acceptsAnySession
+            self.streamTextAtBoundary = streamTextAtBoundary
+            self.streamSessionIDAtBoundary = streamSessionIDAtBoundary
             self.bufferedEvents = bufferedEvents
         }
 
@@ -2010,11 +2016,22 @@ final class AppState: ObservableObject {
     func beginReconciliation() -> UUID {
         let token = UUID()
         let bufferedEvents = reconciliation?.bufferedEvents ?? []
+        let streamTextAtBoundary: String?
+        let streamSessionIDAtBoundary: String?
+        if let existingReconciliation = reconciliation {
+            streamTextAtBoundary = existingReconciliation.streamTextAtBoundary
+            streamSessionIDAtBoundary = existingReconciliation.streamSessionIDAtBoundary
+        } else {
+            streamTextAtBoundary = activeSessionId.map { _ in streamingBuffer }
+            streamSessionIDAtBoundary = activeSessionId
+        }
         reconciliationToken = token
         reconciliation = Reconciliation(
             token: token,
             requestedSessionId: activeSessionId ?? "",
             acceptsAnySession: true,
+            streamTextAtBoundary: streamTextAtBoundary,
+            streamSessionIDAtBoundary: streamSessionIDAtBoundary,
             bufferedEvents: bufferedEvents
         )
         refreshActiveChatScrollSessionIdentity(isReconciling: true)
@@ -2176,14 +2193,15 @@ final class AppState: ObservableObject {
         ), chatViewportTransitionIsCurrent(requiredViewportTransitionGeneration) else {
             return false
         }
-        let bufferedEvents = reconciliation?.token == token
-            ? reconciliation?.bufferedEvents ?? []
-            : []
+        let priorReconciliation = reconciliation?.token == token ? reconciliation : nil
+        let bufferedEvents = priorReconciliation?.bufferedEvents ?? []
         reconciliation = Reconciliation(
             token: token,
             requestedSessionId: sessionId,
             automaticSyncOperationID: automaticSyncOperationID,
             acceptedSessionIDs: acceptedSessionIDs.union([sessionId]),
+            streamTextAtBoundary: priorReconciliation?.streamTextAtBoundary,
+            streamSessionIDAtBoundary: priorReconciliation?.streamSessionIDAtBoundary,
             bufferedEvents: bufferedEvents
         )
         refreshActiveChatScrollSessionIdentity(isReconciling: true)
@@ -2271,6 +2289,9 @@ final class AppState: ObservableObject {
                 settleReconciliation(token, automaticSyncOperationID: automaticSyncOperationID)
                 return false
             }
+            let resumedInflightText = result.snapshot.hasLiveProjection
+                ? streamingBuffer
+                : nil
             await refreshChatResumeContext(sessionId: result.sessionId, using: client)
 
             guard automaticChatResumeWorkIsCurrent(
@@ -2292,13 +2313,27 @@ final class AppState: ObservableObject {
                 }
                 : []
             if result.snapshot.hasLiveProjection {
+                let knownPrefix: String?
+                if let boundary = reconciliation,
+                   boundary.token == token,
+                   let boundarySessionID = boundary.streamSessionIDAtBoundary,
+                   !boundarySessionID.isEmpty,
+                   (boundarySessionID == result.sessionId
+                    || boundarySessionID == boundary.requestedSessionId
+                    || boundary.acceptedSessionIDs.contains(boundarySessionID)) {
+                    knownPrefix = boundary.streamTextAtBoundary
+                } else {
+                    knownPrefix = nil
+                }
+
                 // The live bubble was just seeded from the cumulative inflight
                 // projection, which already includes deltas emitted while this
-                // reconciliation was in flight. Replaying them verbatim repeats
-                // that text in the bubble.
+                // reconciliation was in flight. Replay only the portion beyond
+                // the exact text captured at the reconciliation boundary.
                 bufferedEvents = Self.deduplicatingBufferedEvents(
                     bufferedEvents,
-                    againstInflight: result.snapshot.inflightAssistantText
+                    againstInflight: resumedInflightText ?? "",
+                    knownPrefix: knownPrefix
                 )
             }
             bufferedEvents.forEach(applyStreamEvent)
@@ -2655,57 +2690,58 @@ final class AppState: ObservableObject {
 
     /// Deltas buffered while reconciliation ran are usually already contained
     /// in the resume snapshot's cumulative `inflight` projection — replaying
-    /// them on top of the seeded live bubble repeats that text. Collapse the
-    /// buffered deltas to the suffix the snapshot has not covered yet (their
-    /// concatenation overlaps the snapshot's tail), emitted as a single delta
-    /// in place of the last buffered one. Non-delta events pass through.
+    /// them on top of the seeded live bubble repeats that text. When the exact
+    /// stream text at the reconciliation boundary is known, consume only the
+    /// corresponding prefix of the buffered deltas. Without that boundary,
+    /// repeated text is ambiguous, so leave the events untouched.
     nonisolated static func deduplicatingBufferedEvents(
         _ events: [StreamEvent],
-        againstInflight inflight: String
+        againstInflight inflight: String,
+        knownPrefix: String?
     ) -> [StreamEvent] {
-        guard !inflight.isEmpty else { return events }
-        let deltaTexts: [String] = events.compactMap {
-            if case .messageDelta(_, let text) = $0 { return text }
+        guard let knownPrefix,
+              inflight.hasPrefix(knownPrefix) else {
+            return events
+        }
+
+        let covered = inflight.count - knownPrefix.count
+        guard covered > 0 else { return events }
+
+        let deltaSessionIDs = Set(events.compactMap { event in
+            if case .messageDelta(let sessionId, _) = event {
+                return sessionId
+            }
             return nil
+        })
+        guard deltaSessionIDs.count == 1 else {
+            return events
         }
-        guard !deltaTexts.isEmpty else { return events }
 
-        let combined = deltaTexts.joined()
-        let covered = overlapLength(betweenSuffixOf: inflight, andPrefixOf: combined)
-        let remainder = String(combined.dropFirst(covered))
-        guard remainder.count < combined.count else { return events }
-
-        let lastDeltaIndex = events.lastIndex {
-            if case .messageDelta = $0 { return true }
-            return false
-        }
+        var remainingCoverage = covered
         var deduplicated: [StreamEvent] = []
-        for (index, event) in events.enumerated() {
-            guard case .messageDelta(let sessionId, _) = event else {
+        deduplicated.reserveCapacity(events.count)
+        for event in events {
+            guard case .messageDelta(let sessionId, let text) = event else {
                 deduplicated.append(event)
                 continue
             }
-            if index == lastDeltaIndex, !remainder.isEmpty {
+            guard remainingCoverage > 0 else {
+                deduplicated.append(event)
+                continue
+            }
+
+            let consumed = min(remainingCoverage, text.count)
+            guard consumed > 0 else {
+                deduplicated.append(event)
+                continue
+            }
+            remainingCoverage -= consumed
+            let remainder = String(text.dropFirst(consumed))
+            if !remainder.isEmpty {
                 deduplicated.append(.messageDelta(sessionId: sessionId, text: remainder))
             }
         }
         return deduplicated
-    }
-
-    /// Longest `k` where the last `k` characters of `text` equal the first
-    /// `k` characters of `candidate`. The buffered stream is contiguous, so
-    /// the snapshot's tail and the buffer's head meet at exactly one offset.
-    nonisolated static func overlapLength(betweenSuffixOf text: String, andPrefixOf candidate: String) -> Int {
-        let textChars = Array(text)
-        let candidateChars = Array(candidate)
-        var k = min(textChars.count, candidateChars.count)
-        while k > 0 {
-            if textChars.suffix(k).elementsEqual(candidateChars.prefix(k)) {
-                return k
-            }
-            k -= 1
-        }
-        return 0
     }
 
     /// `session.resume.inflight` is a cumulative projection on some gateways.
