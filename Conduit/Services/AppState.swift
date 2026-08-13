@@ -139,16 +139,18 @@ struct SessionCatalogCache {
         sessionsByKey[key]
     }
 
-    /// Preserve the previous live snapshot when the dashboard returns no
-    /// usable rows. An empty response is not safe evidence that a populated
-    /// catalog was deleted: it can also represent a transient, malformed, or
-    /// profile-mismatched response.
-    func cachedSessionsForLiveMerge(
+    /// Returns cached rows to merge unless the dashboard supplied a meaningful
+    /// authoritative replacement. An empty response is not safe evidence that
+    /// a populated catalog was deleted: it can also represent a transient,
+    /// malformed, or profile-mismatched response.
+    func cachedSessionsToMerge(
         remoteSessions: [SessionSummary],
         isAuthoritative: Bool,
         forKey key: String
     ) -> [SessionSummary] {
-        guard !isAuthoritative || remoteSessions.isEmpty else { return [] }
+        if isAuthoritative && !remoteSessions.isEmpty {
+            return []
+        }
         return sessions(forKey: key)
     }
 
@@ -4859,7 +4861,7 @@ final class AppState: ObservableObject {
                         sessionBelongsToProfile($0, profile: profile)
                     }
 
-                    let cached = sessionCatalogCache.cachedSessionsForLiveMerge(
+                    let cached = sessionCatalogCache.cachedSessionsToMerge(
                         remoteSessions: scoped,
                         isAuthoritative: scopedResult.isAuthoritative,
                         forKey: cacheKey
@@ -5037,7 +5039,8 @@ final class AppState: ObservableObject {
             let offset = page * 200
             let response = try await bridge.requestJSON(path: profileSessionsPath(profile, offset: offset))
             let batch = response["sessions"] as? [Any] ?? []
-            sessions += dashboardOwnedSessions(batch, profile: profile)
+            let normalizedBatch = dashboardOwnedSessions(batch, profile: profile)
+            sessions += normalizedBatch
 
             let nextOffset = integerValue(response["next_offset"] ?? response["nextOffset"])
             let total = integerValue(response["total"])
@@ -5045,8 +5048,14 @@ final class AppState: ObservableObject {
                 || (nextOffset ?? 0) > offset
                 || (total.map { offset + batch.count < $0 } ?? false)
                 || batch.count == 200
-            if !hasMore || batch.isEmpty {
-                isAuthoritative = !sessions.isEmpty
+            if batch.isEmpty {
+                // An empty page after a non-empty prefix is not proof that
+                // the full catalog was read. Preserve older rows and retry a
+                // complete load later instead of evicting the cached suffix.
+                break
+            }
+            if !hasMore {
+                isAuthoritative = !normalizedBatch.isEmpty
                 break
             }
         }

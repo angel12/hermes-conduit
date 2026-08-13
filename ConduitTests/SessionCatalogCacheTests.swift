@@ -132,7 +132,7 @@ final class SessionCatalogCacheTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            cache.cachedSessionsForLiveMerge(
+            cache.cachedSessionsToMerge(
                 remoteSessions: [],
                 isAuthoritative: true,
                 forKey: "default:exclude"
