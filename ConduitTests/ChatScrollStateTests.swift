@@ -149,6 +149,39 @@ final class ChatScrollStateTests: XCTestCase {
                 hasNotificationHandoff: false
             )
         )
+        XCTAssertTrue(
+            ChatFollowLatestRelatchPolicy.isCompletionCurrent(
+                completed: noSession,
+                current: equivalentCurrent,
+                identity: identity,
+                isDragging: false,
+                hasPendingRestoration: false,
+                hasNotificationHandoff: false
+            )
+        )
+        XCTAssertFalse(
+            ChatFollowLatestRelatchPolicy.isCompletionCurrent(
+                completed: equivalentCurrent,
+                current: noSession,
+                identity: identity,
+                isDragging: false,
+                hasPendingRestoration: false,
+                hasNotificationHandoff: false
+            )
+        )
+    }
+
+    func testTranscriptTransitionKeepsFollowDisabledForActiveDrag() {
+        XCTAssertFalse(
+            ChatFollowLatestRelatchPolicy.shouldFollowLatestAfterTransition(
+                isDragging: true
+            )
+        )
+        XCTAssertTrue(
+            ChatFollowLatestRelatchPolicy.shouldFollowLatestAfterTransition(
+                isDragging: false
+            )
+        )
     }
 
     func testDragLifecycleCapturesStartAndSuppressesInvalidatedGestureUntilFinish() {

@@ -323,7 +323,8 @@ struct ChatView: View {
                     }
                     guard !keysAreEquivalent else { return }
                     topVisibleChatID = nil
-                    followsLatest = true
+                    followsLatest = ChatFollowLatestRelatchPolicy
+                        .shouldFollowLatestAfterTransition(isDragging: isDraggingChat)
                     scrollToLatest(using: proxy)
                 }
                 .onChange(of: appState.activeProfile) { _, _ in
@@ -350,7 +351,8 @@ struct ChatView: View {
                         return
                     }
                     guard oldKey != newKey else { return }
-                    followsLatest = true
+                    followsLatest = ChatFollowLatestRelatchPolicy
+                        .shouldFollowLatestAfterTransition(isDragging: isDraggingChat)
                     scrollToLatest(using: proxy)
                 }
                 .onChange(of: appState.activeChatScrollSessionIdentity) { _, _ in
@@ -696,7 +698,8 @@ struct ChatView: View {
         notificationHandoffPending = false
         notificationHandoffSessionKey = nil
         cancelAutomaticRestoration()
-        followsLatest = true
+        followsLatest = ChatFollowLatestRelatchPolicy
+            .shouldFollowLatestAfterTransition(isDragging: isDraggingChat)
         var transaction = Transaction()
         transaction.animation = nil
         withTransaction(transaction) {

@@ -107,6 +107,10 @@ enum ChatFollowLatestRelatchPolicy {
             && !isDragging
     }
 
+    static func shouldFollowLatestAfterTransition(isDragging: Bool) -> Bool {
+        !isDragging
+    }
+
     static func isCompletionCurrent(
         completed: ChatDragCompletionToken,
         current: ChatDragCompletionToken,
@@ -115,7 +119,11 @@ enum ChatFollowLatestRelatchPolicy {
         hasPendingRestoration: Bool,
         hasNotificationHandoff: Bool
     ) -> Bool {
-        let sameSession = completed.sessionKey == current.sessionKey
+        // A new chat can acquire its first server session ID without replacing
+        // the viewport. The transition generation distinguishes that identity
+        // resolution from an actual transcript transition.
+        let sameSession = completed.sessionKey == nil
+            || completed.sessionKey == current.sessionKey
             || identity.areEquivalent(completed.sessionKey, current.sessionKey)
         return completed.dragGeneration == current.dragGeneration
             && completed.viewportTransitionGeneration == current.viewportTransitionGeneration
