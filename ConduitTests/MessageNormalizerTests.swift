@@ -89,6 +89,120 @@ final class MessageNormalizerTests: XCTestCase {
         XCTAssertEqual(sessions.compactMap(\.profile), ["work", "personal"])
     }
 
+    func testSessionNormalizationKeepsStoredIDSeparateFromRuntimeID() {
+        let sessions = MessageNormalizer.normalizeSessions(
+            .object([
+                "sessions": .array([
+                    .object([
+                        "session_id": .string("runtime-123"),
+                        "id": .string("stored-123"),
+                        "profile": .string("default")
+                    ])
+                ])
+            ]),
+            profile: "default"
+        )
+
+        XCTAssertEqual(sessions.first?.storedSessionId, "stored-123")
+        XCTAssertTrue(sessions.first?.alternateIds.contains("stored-123") == true)
+    }
+
+    func testSessionNormalizationDoesNotTreatLoneIDAsVerifiedStoredID() {
+        let sessions = MessageNormalizer.normalizeSessions(
+            .object([
+                "sessions": .array([
+                    .object(["id": .string("ambiguous-123")])
+                ])
+            ]),
+            profile: "default"
+        )
+
+        XCTAssertNil(sessions.first?.storedSessionId)
+    }
+
+    func testNotificationRuntimeIDResolvesToStoredSessionID() {
+        let session = SessionSummary(
+            id: "runtime-123",
+            storedSessionId: "stored-123",
+            alternateIds: ["stored-123"],
+            title: "A session",
+            model: "Hermes",
+            updatedLabel: "now",
+            profile: "default",
+            source: .chat,
+            isActive: false,
+            isArchived: false
+        )
+
+        XCTAssertEqual(
+            NotificationSessionResolver.resumableSessionID(for: "runtime-123", in: [session]),
+            "stored-123"
+        )
+    }
+
+    func testNotificationResolverTrimsUnknownRuntimeID() {
+        XCTAssertEqual(
+            NotificationSessionResolver.resumableSessionID(for: "  runtime-123  ", in: []),
+            "runtime-123"
+        )
+    }
+
+    func testFailedNotificationRouteClearsPendingTarget() {
+        let service = PushNotificationService.shared
+        defer {
+            if let pendingTarget = service.pendingTarget {
+                service.clearPendingTarget(pendingTarget)
+            }
+        }
+        service.receiveNotificationPayload([
+            "conduit": [
+                "session_id": "runtime-123",
+                "type": "response_ready"
+            ] as [String: Any]
+        ])
+
+        guard let target = service.pendingTarget else {
+            return XCTFail("Expected the notification target to be pending")
+        }
+
+        service.clearPendingTarget(target)
+
+        XCTAssertNil(service.pendingTarget)
+    }
+
+    func testFailedNotificationRouteRetriesOnceThenClearsTarget() async {
+        let service = PushNotificationService(retryDelay: .zero)
+        service.receiveNotificationPayload([
+            "conduit": [
+                "session_id": "runtime-123",
+                "type": "response_ready"
+            ] as [String: Any]
+        ])
+        guard let target = service.pendingTarget else {
+            return XCTFail("Expected the notification target to be pending")
+        }
+
+        let initialAttempt = service.navigationAttempt
+        XCTAssertTrue(service.handleFailedNotificationRoute(target))
+        let retryDeadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while service.navigationAttempt == initialAttempt,
+              ContinuousClock.now < retryDeadline {
+            await Task.yield()
+        }
+        XCTAssertEqual(service.navigationAttempt, initialAttempt + 1)
+        XCTAssertEqual(service.pendingTarget, target)
+
+        XCTAssertFalse(service.handleFailedNotificationRoute(target))
+        XCTAssertNil(service.pendingTarget)
+        let terminalAttempt = service.navigationAttempt
+        let terminalDeadline = ContinuousClock.now.advanced(by: .milliseconds(100))
+        while service.navigationAttempt == terminalAttempt,
+              ContinuousClock.now < terminalDeadline {
+            await Task.yield()
+        }
+        XCTAssertEqual(service.navigationAttempt, terminalAttempt)
+    }
+
     func testSessionNormalizationDoesNotInventOwnershipWithoutFallback() {
         let sessions = MessageNormalizer.normalizeSessions(
             .object([

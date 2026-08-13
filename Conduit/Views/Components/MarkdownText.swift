@@ -26,12 +26,19 @@ struct MarkdownText: View {
     /// while already-read text remains fully stable.
     var newestCharacterOpacities: [Double] = []
 
+    /// True only for the actively streaming reply, whose `source` changes
+    /// every frame. Settled messages (the default) populate the render cache;
+    /// the streaming instance still parses each frame but skips inserting a
+    /// snapshot that would be dead the moment the next delta arrives.
+    var isStreaming: Bool = false
+
     var body: some View {
         let rendering = MarkdownRenderCache.rendering(
             source: source,
             recognizesGatewayMedia: gatewayMediaDataURL != nil,
             foregroundStyle: foregroundStyle,
-            usesAccentSurface: usesAccentSurface
+            usesAccentSurface: usesAccentSurface,
+            isStreaming: isStreaming
         )
 
         Group {
@@ -91,21 +98,37 @@ private enum MarkdownRenderCache {
     private static let cache: NSCache<NSString, MarkdownRendering> = {
         let cache = NSCache<NSString, MarkdownRendering>()
         cache.countLimit = 256
+        cache.totalCostLimit = 32 * 1024 * 1024
         return cache
     }()
 
+    @MainActor
     static func rendering(
         source: String,
         recognizesGatewayMedia: Bool,
         foregroundStyle: Color,
-        usesAccentSurface: Bool
+        usesAccentSurface: Bool,
+        isStreaming: Bool
     ) -> MarkdownRendering {
-        // Fonts resolve against the current Dynamic Type size, so a size
-        // change must miss the cache rather than serve stale metrics.
+        // `foregroundStyle` is deliberately absent from the key: only two
+        // values are ever passed (.primary / .white), each uniquely tied to
+        // `usesAccentSurface` (false / true), so keying on that is stable —
+        // whereas `String(describing:)` of a SwiftUI Color is not (its
+        // description is undocumented and can drift for adaptive colors). The
+        // assert fails loudly in debug if a third style is ever introduced;
+        // promote it to an explicit key token then.
+        assert(
+            usesAccentSurface ? foregroundStyle == .white : foregroundStyle == .primary,
+            "MarkdownRenderCache keys on usesAccentSurface, not foregroundStyle; a new style needs an explicit key token."
+        )
+
+        // Fonts resolve against the current Dynamic Type size, so a size change
+        // must miss the cache rather than serve stale metrics. Reading
+        // preferredContentSizeCategory touches UIApplication.shared, hence the
+        // @MainActor isolation on this function.
         let key = [
             recognizesGatewayMedia ? "1" : "0",
             usesAccentSurface ? "1" : "0",
-            String(describing: foregroundStyle),
             UIApplication.shared.preferredContentSizeCategory.rawValue,
             source
         ].joined(separator: "|") as NSString
@@ -121,7 +144,18 @@ private enum MarkdownRenderCache {
                 newestCharacterOpacities: []
             )
         )
-        cache.setObject(rendering, forKey: key)
+        // While streaming, `source` changes every frame, so a cached entry is
+        // dead on insertion and would only evict reusable settled entries.
+        // Parse anyway (unavoidable — the content is new), but skip the write.
+        // The message is cached on its first settled render via the
+        // non-streaming call sites (isStreaming == false).
+        if !isStreaming {
+            // Approximate byte cost: source bytes + attributed-string storage
+            // (each char carries attribute runs), so a few large messages can't
+            // crowd out many small ones within totalCostLimit.
+            let cost = source.utf8.count + (rendering.selectableText?.length ?? 0) * 4
+            cache.setObject(rendering, forKey: key, cost: cost)
+        }
         return rendering
     }
 }
@@ -830,9 +864,165 @@ private struct RemoteMarkdownImage: View {
     }
 }
 
+/// Resolves a model-authored image destination without treating a non-nil URL
+/// as proof that it is a usable web destination. Strict parsing preserves
+/// existing percent escapes; component-aware repair handles spaces and other
+/// invalid characters without encoding URL delimiters or double-encoding `%XX`.
+enum WebFallbackImageDestination {
+    static func resolve(_ value: String) -> URL? {
+        if let strictURL = URL(string: value, encodingInvalidCharacters: false),
+           isValidWebDestination(strictURL) {
+            return strictURL
+        }
+
+        guard var components = URLComponents(string: value),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = components.host,
+              !host.isEmpty,
+              let rawComponents = rawComponents(from: value),
+              let encodedPath = encodedComponent(
+                  rawComponents.path,
+                  allowedCharacters: .urlPathAllowed
+              ) else {
+            return nil
+        }
+
+        components.scheme = scheme
+        components.percentEncodedPath = encodedPath
+        if let query = rawComponents.query {
+            guard let encodedQuery = encodedComponent(
+                query,
+                allowedCharacters: .urlQueryAllowed
+            ) else { return nil }
+            components.percentEncodedQuery = encodedQuery
+        } else {
+            components.percentEncodedQuery = nil
+        }
+        if let fragment = rawComponents.fragment {
+            guard let encodedFragment = encodedComponent(
+                fragment,
+                allowedCharacters: .urlFragmentAllowed
+            ) else { return nil }
+            components.percentEncodedFragment = encodedFragment
+        } else {
+            components.percentEncodedFragment = nil
+        }
+
+        return isValidWebDestination(components.url) ? components.url : nil
+    }
+
+    private struct RawComponents {
+        let path: String
+        let query: String?
+        let fragment: String?
+    }
+
+    /// URLComponents exposes a decoded `path` when a URL has another invalid
+    /// component. Reading that value would turn an existing `%2F` into `/`
+    /// while repairing, so split the original string before encoding each
+    /// component instead.
+    private static func rawComponents(from value: String) -> RawComponents? {
+        guard let schemeEnd = value.firstIndex(of: ":") else { return nil }
+        let authorityStart = value.index(after: schemeEnd)
+        guard value[authorityStart...].hasPrefix("//") else { return nil }
+
+        let suffixStart = value.index(authorityStart, offsetBy: 2)
+        guard let firstDelimiter = value[suffixStart...].firstIndex(where: { character in
+            character == "/" || character == "?" || character == "#"
+        }) else {
+            return RawComponents(path: "", query: nil, fragment: nil)
+        }
+
+        let suffix = value[firstDelimiter...]
+        let queryDelimiter = suffix.firstIndex(of: "?")
+        let fragmentDelimiter = suffix.firstIndex(of: "#")
+        let pathEnd = [queryDelimiter, fragmentDelimiter]
+            .compactMap { $0 }
+            .min() ?? suffix.endIndex
+        let path = String(suffix[..<pathEnd])
+
+        let query: String?
+        if let queryDelimiter,
+           fragmentDelimiter.map({ queryDelimiter < $0 }) ?? true {
+            let queryEnd = fragmentDelimiter ?? suffix.endIndex
+            query = String(suffix[suffix.index(after: queryDelimiter)..<queryEnd])
+        } else {
+            query = nil
+        }
+
+        let fragment = fragmentDelimiter.map { delimiter in
+            String(suffix[suffix.index(after: delimiter)...])
+        }
+
+        return RawComponents(path: path, query: query, fragment: fragment)
+    }
+
+    private static func isValidWebDestination(_ url: URL?) -> Bool {
+        guard let url,
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host,
+              !host.isEmpty else { return false }
+        return true
+    }
+
+    private static func encodedComponent(
+        _ value: String,
+        allowedCharacters: CharacterSet
+    ) -> String? {
+        var allowed = allowedCharacters
+        allowed.insert(charactersIn: "%")
+        return escapedStrayPercents(in: value)
+            .addingPercentEncoding(withAllowedCharacters: allowed)
+    }
+
+    private static func escapedStrayPercents(in value: String) -> String {
+        let bytes = Array(value.utf8)
+        var escaped: [UInt8] = []
+        escaped.reserveCapacity(bytes.count)
+        var index = 0
+
+        while index < bytes.count {
+            guard bytes[index] == 37 else {
+                escaped.append(bytes[index])
+                index += 1
+                continue
+            }
+
+            if index + 2 < bytes.count,
+               isHexDigit(bytes[index + 1]),
+               isHexDigit(bytes[index + 2]) {
+                escaped.append(contentsOf: bytes[index...(index + 2)])
+                index += 3
+            } else {
+                escaped.append(contentsOf: [37, 50, 53])
+                index += 1
+            }
+        }
+
+        return String(decoding: escaped, as: UTF8.self)
+    }
+
+    private static func isHexDigit(_ byte: UInt8) -> Bool {
+        (byte >= 48 && byte <= 57)
+            || (byte >= 65 && byte <= 70)
+            || (byte >= 97 && byte <= 102)
+    }
+}
+
 /// AsyncImage is fast for ordinary HTTPS hosts. Some image CDNs reject its
 /// URLSession user agent or redirect to HTTP; WebKit follows the same browser
 /// path as the source link, but is isolated to this image-only fallback.
+enum WebFallbackImageLabel {
+    static func title(alt: String, destinationAvailable: Bool) -> String {
+        if destinationAvailable {
+            return alt.isEmpty ? "Open image" : "\(alt) — image unavailable; open source"
+        }
+        return alt.isEmpty ? "Image unavailable" : "\(alt) unavailable"
+    }
+}
+
 private struct WebFallbackImage: View {
     let url: String
     let alt: String
@@ -842,18 +1032,39 @@ private struct WebFallbackImage: View {
     var body: some View {
         Group {
             if failed {
-                Link(destination: URL(string: url)!) {
-                    Label(alt.isEmpty ? "Open image" : "Image unavailable — open source", systemImage: "photo.badge.exclamationmark")
-                        .font(.footnote.weight(.semibold))
-                }
-                .tint(.conduitAccent)
-                .padding(12)
-                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                // A model-authored URL is not guaranteed to be RFC-valid
+                // (unencoded non-ASCII paths are common); force-unwrapping
+                // here crashed the app on exactly the images most likely to
+                // reach this fallback.
+                fallbackLabel
+                    .padding(12)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
             } else {
                 RemoteImageWebView(url: url, height: $height, failed: $failed)
                     .frame(height: min(max(height, 80), 420))
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
+        }
+    }
+
+    @ViewBuilder
+    private var fallbackLabel: some View {
+        if let destination = WebFallbackImageDestination.resolve(url) {
+            Link(destination: destination) {
+                Label(
+                    WebFallbackImageLabel.title(alt: alt, destinationAvailable: true),
+                    systemImage: "photo.badge.exclamationmark"
+                )
+                .font(.footnote.weight(.semibold))
+            }
+                .tint(.conduitAccent)
+        } else {
+            Label(
+                WebFallbackImageLabel.title(alt: alt, destinationAvailable: false),
+                systemImage: "photo.badge.exclamationmark"
+            )
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
         }
     }
 }
@@ -1359,10 +1570,19 @@ private final class HighlightedCode {
 private enum SyntaxHighlighter {
     /// Settled code blocks across the transcript re-render at streaming frame
     /// rate; tokenizing is linear but allocation-heavy, so memoize by content.
-    /// Only the still-growing streaming block misses per frame.
+    ///
+    /// Unlike `MarkdownRenderCache` (keyed on whole-message source, which is
+    /// transient every frame while streaming and therefore skips writes), this
+    /// cache is keyed per code block by (language, source). Only the single
+    /// still-growing block produces a throwaway entry each frame; stable blocks
+    /// — both earlier in the streaming message and across the settled
+    /// transcript — have a constant key and hit on every subsequent frame, so
+    /// writes here are worth keeping. The one transient entry per frame is
+    /// bounded and self-evicting under NSCache's LRU/memory policy.
     private static let cache: NSCache<NSString, HighlightedCode> = {
         let cache = NSCache<NSString, HighlightedCode>()
         cache.countLimit = 128
+        cache.totalCostLimit = 16 * 1024 * 1024
         return cache
     }()
 
@@ -1370,7 +1590,7 @@ private enum SyntaxHighlighter {
         let key = "\(language)|\(source)" as NSString
         if let cached = cache.object(forKey: key) { return cached.value }
         let highlighted = tokenize(source, language: language)
-        cache.setObject(HighlightedCode(highlighted), forKey: key)
+        cache.setObject(HighlightedCode(highlighted), forKey: key, cost: source.utf8.count)
         return highlighted
     }
 
