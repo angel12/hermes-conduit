@@ -4,7 +4,7 @@
 
 **Goal:** Update PR #46 onto current `main` while retaining only its session-catalog cache invalidation behavior.
 
-**Architecture:** Use a non-rewriting merge of current `origin/main` into the contributor-owned PR branch. Current `main` remains authoritative for the already-merged stream, WebSocket, WebKit, rendering-cache, and image-fallback code; PR #46 contributes its AppState cache invalidation and generation-checked commit logic. The cache remains private to `AppState`; the standalone cache value type provides focused coverage for stale write rejection without adding a test-only production hook, while the end-to-end WebKit-backed delete/archive flow remains an integration boundary outside the unit-test seam.
+**Architecture:** Use a non-rewriting merge of current `origin/main` into the contributor-owned PR branch. Current `main` remains authoritative for the already-merged stream, WebSocket, WebKit, rendering-cache, and image-fallback code; PR #46 contributes its AppState cache invalidation, bounded generation-checked retry, authoritative-catalog replacement, and cache expiry logic. The cache remains private to `AppState`; the standalone cache value type provides focused coverage for stale writes, alias-aware purges, failed cron loads, authoritative omissions, and expiry without adding a test-only production hook.
 
 **Tech Stack:** Swift 5.9, SwiftUI, XCTest, XcodeGen, Xcode 26.5, iOS Simulator.
 
@@ -13,6 +13,9 @@
 - Do not rewrite or force-push the contributor-owned PR branch.
 - Preserve current `main` implementations for all behavior already merged through PR #45.
 - Keep the session cache purge attached to successful delete/archive paths and explicit disconnect.
+- Abort catalog publication when the profile, client, or dashboard bridge changes while a request is suspended.
+- Preserve the previous cron cache when its refresh fails, and bound mutation retries.
+- Replace cached live rows after a complete dashboard catalog response; retain older rows only for explicitly partial responses, which are refreshed after a bounded cache lifetime.
 - Do not add a production-only test hook solely to expose private AppState caches.
 - Run the generated-project full test suite before publishing the branch.
 
@@ -49,7 +52,8 @@ freshness guarantee.
 Run:
 
 ```bash
-git merge origin/main --no-edit
+git merge --no-ff origin/main --no-edit
+test "$(git rev-parse HEAD^2)" = "$(git rev-parse origin/main)"
 ```
 
 If a conflict occurs, keep current `origin/main` for the already-merged
@@ -88,10 +92,14 @@ Run:
 
 ```bash
 git status --short
+git add -A
+test -z "$(git diff --name-only --diff-filter=U)"
 git commit -m "Merge current main into PR46 salvage"
 ```
 
-Skip the commit command when `git merge` already created the merge commit.
+Skip the commit command when `git merge` already created the merge commit. The
+staging and unmerged-path checks apply only when conflict resolution was
+needed.
 
 ### Task 2: Verify the cache behavior without adding test-only hooks
 
@@ -101,9 +109,10 @@ Skip the commit command when `git merge` already created the merge commit.
 
 **Interfaces:**
 - Consumes: The reduced effective diff from Task 1.
-- Produces: Focused coverage for rejecting a stale cache commit after a
-  destructive mutation, with the WebKit-backed delete/archive integration
-  boundary explicitly recorded as unverified by unit tests.
+- Produces: Focused coverage for stale commit rejection, alias-aware purges,
+  cache reset, failed cron refreshes, authoritative remote omissions, and
+  bounded full-history expiry. The WebKit-backed delete/archive integration
+  boundary remains outside the unit-test harness.
 
 - [ ] **Step 1: Check existing test seams before adding coverage**
 
@@ -114,7 +123,7 @@ rg -n -C 8 "sessionCatalogCache|SessionCatalogCache|removeSessionFromLiveCatalog
 ```
 
 Expected: do not change `AppState` production visibility merely to inspect
-private cache storage. Keep the focused test at the cache commit boundary and
+private cache storage. Keep focused tests at the cache policy boundary and
 record that the WebKit-backed delete/archive and disconnect/re-sign-in flows
 remain integration boundaries not exercised by the unit-test harness.
 

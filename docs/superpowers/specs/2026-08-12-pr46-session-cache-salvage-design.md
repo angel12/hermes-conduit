@@ -18,10 +18,15 @@ owned by the contributor fork.
    - remove deleted or archived sessions from every profile catalog cache;
    - clear profile catalog caches and full-history markers on disconnect so a
      later sign-in performs an authoritative reload.
+   - reject stale catalog commits after an interleaved mutation, abort when
+     the profile/client/bridge context changes, and bound retries;
+   - preserve cron cache entries when refresh requests fail;
+   - replace cached live rows after complete catalog responses and periodically
+     refresh partial catalogs so remote deletions do not remain indefinitely.
 3. Do not reimplement or alter the already-merged stream, WebSocket, WebKit,
    rendering-cache, or image-fallback changes.
-4. Add focused regression coverage only if the existing AppState test seams can
-   verify the cache contract without exposing production-only test hooks.
+4. Add focused regression coverage at the cache policy boundary without
+   exposing production-only test hooks.
 
 ## Integration and behavior
 
@@ -31,6 +36,12 @@ existing successful delete/archive paths and the explicit disconnect path.
 
 The resulting PR should have a small effective diff against `main`, making the
 review target the cache behavior rather than stale historical commits.
+
+Catalog responses that include all pages are authoritative and replace the
+cached live catalog. Responses capped at the available page limit are treated
+as partial and may merge older cached rows; the full catalog is refreshed after
+a bounded cache lifetime. A failed cron refresh leaves its prior cache entry
+untouched and is retried by the next load.
 
 ## Verification
 
