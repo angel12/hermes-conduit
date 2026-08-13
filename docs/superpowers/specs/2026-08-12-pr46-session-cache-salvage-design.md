@@ -21,10 +21,11 @@ owned by the contributor fork.
    - reject stale catalog commits after an interleaved mutation, abort when
      the profile/client/bridge context changes, and bound retries;
    - preserve cron cache entries when refresh requests fail;
-   - replace cached live rows after meaningful complete catalog responses and
-     periodically refresh partial catalogs so remote deletions do not remain
-     indefinitely; empty or unusable responses remain non-authoritative and
-     preserve the previous live snapshot.
+   - replace cached live rows after meaningful complete catalog responses with
+     trustworthy terminal metadata and periodically refresh partial catalogs
+     so remote deletions do not remain indefinitely; empty, unusable, or
+     ambiguous responses remain non-authoritative and preserve the previous
+     live snapshot.
 3. Do not reimplement or alter the already-merged stream, WebSocket, WebKit,
    rendering-cache, or image-fallback changes.
 4. Add focused regression coverage at the cache policy boundary without
@@ -39,13 +40,14 @@ existing successful delete/archive paths and the explicit disconnect path.
 The resulting PR should have a small effective diff against `main`, making the
 review target the cache behavior rather than stale historical commits.
 
-Meaningful catalog responses that include all pages are authoritative and
-replace the cached live catalog. Empty or unusable responses are non-
-authoritative and may merge older cached rows; they do not record a fresh
-full-history marker. Responses capped at the available page limit are treated
-as partial and may merge older cached rows; the full catalog is refreshed after
-a bounded cache lifetime. A failed cron refresh leaves its prior cache entry
-untouched and is retried by the next load.
+Meaningful catalog responses that include all pages and a trustworthy terminal
+signal are authoritative and replace the cached live catalog. Empty, unusable,
+or ambiguous responses without terminal metadata are non-authoritative and may
+merge older cached rows; they do not record a fresh full-history marker.
+Responses capped at the available page limit are treated as partial and may
+merge older cached rows; the full catalog is refreshed after a bounded cache
+lifetime. A failed cron refresh leaves its prior cache entry untouched and is
+retried by the next load.
 
 ## Verification
 

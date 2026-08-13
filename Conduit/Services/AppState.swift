@@ -5042,12 +5042,19 @@ final class AppState: ObservableObject {
             let normalizedBatch = dashboardOwnedSessions(batch, profile: profile)
             sessions += normalizedBatch
 
+            let rawHasMore = response["has_more"] ?? response["hasMore"]
+            let explicitHasMore = rawHasMore.map { booleanValue($0) }
             let nextOffset = integerValue(response["next_offset"] ?? response["nextOffset"])
             let total = integerValue(response["total"])
-            let hasMore = booleanValue(response["has_more"] ?? response["hasMore"])
-                || (nextOffset ?? 0) > offset
-                || (total.map { offset + batch.count < $0 } ?? false)
-                || batch.count == 200
+            let hasExplicitTerminalSignal = explicitHasMore == false
+                || (nextOffset.map { $0 <= offset } ?? false)
+                || (total.map { offset + batch.count >= $0 } ?? false)
+            let hasMore = !hasExplicitTerminalSignal && (
+                explicitHasMore == true
+                    || (nextOffset ?? 0) > offset
+                    || (total.map { offset + batch.count < $0 } ?? false)
+                    || batch.count == 200
+            )
             if batch.isEmpty {
                 // An empty page after a non-empty prefix is not proof that
                 // the full catalog was read. Preserve older rows and retry a
@@ -5055,7 +5062,7 @@ final class AppState: ObservableObject {
                 break
             }
             if !hasMore {
-                isAuthoritative = !normalizedBatch.isEmpty
+                isAuthoritative = hasExplicitTerminalSignal && !normalizedBatch.isEmpty
                 break
             }
         }
