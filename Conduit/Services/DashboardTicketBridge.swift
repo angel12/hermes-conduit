@@ -133,6 +133,13 @@ enum DashboardTicketBridgeError: LocalizedError {
 /// configuration → userContentController → bridge) that `deinit` can never
 /// break — every replaced bridge would keep a WebKit content process alive
 /// for the app's lifetime. The proxy holds the bridge weakly instead.
+///
+/// WebKit delivers `userContentController(_:didReceive:)` on the main thread,
+/// and the proxied bridge is `@MainActor`; marking the proxy `@MainActor` too
+/// makes that isolation contract explicit so the forward into the bridge needs
+/// no implicit cross-actor hop and stays correct under Swift 6 strict
+/// concurrency.
+@MainActor
 private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
     private weak var delegate: WKScriptMessageHandler?
 
@@ -145,6 +152,28 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
     }
 }
 
+final class DashboardTicketBridgePendingRequests {
+    typealias Continuation = CheckedContinuation<[String: Any], Error>
+
+    private var storage: [Int: Continuation] = [:]
+
+    var count: Int { storage.count }
+
+    func insert(_ continuation: Continuation, for id: Int) {
+        storage[id] = continuation
+    }
+
+    func removeValue(for id: Int) -> Continuation? {
+        storage.removeValue(forKey: id)
+    }
+
+    func rejectAll(with error: Error) {
+        let pending = storage
+        storage.removeAll()
+        pending.values.forEach { $0.resume(throwing: error) }
+    }
+}
+
 @MainActor
 final class DashboardTicketBridge: NSObject {
     let baseURL: String
@@ -152,13 +181,19 @@ final class DashboardTicketBridge: NSObject {
     let cloudflareAccess: CloudflareAccessCredentials?
 
     private var isReady = false
+    private var isInvalidated = false
     private var requestID = 0
-    private var pendingRequests: [Int: CheckedContinuation<[String: Any], Error>] = [:]
+    private let pendingRequests: DashboardTicketBridgePendingRequests
 
-    init(baseURL: String, cloudflareAccess: CloudflareAccessCredentials? = nil) {
+    init(
+        baseURL: String,
+        cloudflareAccess: CloudflareAccessCredentials? = nil,
+        pendingRequests: DashboardTicketBridgePendingRequests = DashboardTicketBridgePendingRequests()
+    ) {
         let normalizedBaseURL = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL)) ?? ""
         self.baseURL = normalizedBaseURL
         self.cloudflareAccess = cloudflareAccess
+        self.pendingRequests = pendingRequests
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
         if let script = cloudflareAccess?.fetchInjectionUserScript(expectedBaseURL: normalizedBaseURL), !script.isEmpty {
@@ -177,17 +212,27 @@ final class DashboardTicketBridge: NSObject {
                 into: self.webView.configuration.websiteDataStore.httpCookieStore,
                 for: self.baseURL
             )
+            guard !self.isInvalidated else { return }
             self.loadDashboardSession()
         }
     }
 
     deinit {
+        pendingRequests.rejectAll(with: DashboardTicketBridgeError.notReady)
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "dashboard-response")
     }
 
-    func reload() {
+    func invalidate() {
+        guard !isInvalidated else { return }
+        isInvalidated = true
         isReady = false
-        rejectPending(with: DashboardTicketBridgeError.notReady)
+        pendingRequests.rejectAll(with: DashboardTicketBridgeError.notReady)
+    }
+
+    func reload() {
+        guard !isInvalidated else { return }
+        isReady = false
+        pendingRequests.rejectAll(with: DashboardTicketBridgeError.notReady)
         Task { [weak self] in
             guard let self else { return }
             await DashboardCookiePersistence.restore(into: self.webView.configuration.websiteDataStore.httpCookieStore)
@@ -195,6 +240,7 @@ final class DashboardTicketBridge: NSObject {
                 into: self.webView.configuration.websiteDataStore.httpCookieStore,
                 for: self.baseURL
             )
+            guard !self.isInvalidated else { return }
             self.loadDashboardSession()
         }
     }
@@ -220,10 +266,10 @@ final class DashboardTicketBridge: NSObject {
     }
 
     private func waitUntilReady() async throws {
-        for _ in 0..<30 where !isReady {
+        for _ in 0..<30 where !isReady && !isInvalidated {
             try await Task.sleep(for: .milliseconds(100))
         }
-        guard isReady else { throw DashboardTicketBridgeError.notReady }
+        guard !isInvalidated, isReady else { throw DashboardTicketBridgeError.notReady }
     }
 
     /// Requests authenticated dashboard JSON through the same WebKit cookie
@@ -236,10 +282,10 @@ final class DashboardTicketBridge: NSObject {
         timeoutMilliseconds: Int = 12_000,
         maxResponseBytes: Int = DataURLLimits.maxJSONResponseBytes
     ) async throws -> [String: Any] {
-        for _ in 0..<30 where !isReady {
+        for _ in 0..<30 where !isReady && !isInvalidated {
             try await Task.sleep(for: .milliseconds(100))
         }
-        guard isReady else { throw DashboardTicketBridgeError.notReady }
+        guard !isInvalidated, isReady else { throw DashboardTicketBridgeError.notReady }
 
         requestID += 1
         let id = requestID
@@ -256,7 +302,7 @@ final class DashboardTicketBridge: NSObject {
                     return
                 }
 
-                pendingRequests[id] = continuation
+                pendingRequests.insert(continuation, for: id)
                 let script = """
                 (async function() {
                     try {
@@ -316,7 +362,7 @@ final class DashboardTicketBridge: NSObject {
                 true;
                 """
                 webView.evaluateJavaScript(script) { _, error in
-                    guard let error, let pending = self.pendingRequests.removeValue(forKey: id) else { return }
+                    guard let error, let pending = self.pendingRequests.removeValue(for: id) else { return }
                     pending.resume(throwing: error)
                 }
             }
@@ -328,7 +374,7 @@ final class DashboardTicketBridge: NSObject {
     }
 
     private func cancelPendingRequest(id: Int) {
-        guard let continuation = pendingRequests.removeValue(forKey: id) else { return }
+        guard let continuation = pendingRequests.removeValue(for: id) else { return }
         continuation.resume(throwing: CancellationError())
     }
 
@@ -349,9 +395,7 @@ final class DashboardTicketBridge: NSObject {
     }
 
     private func rejectPending(with error: Error) {
-        let pending = pendingRequests
-        pendingRequests.removeAll()
-        pending.values.forEach { $0.resume(throwing: error) }
+        pendingRequests.rejectAll(with: error)
     }
 }
 
@@ -425,7 +469,7 @@ extension DashboardTicketBridge: WKScriptMessageHandler {
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               payload["type"] as? String == "dashboard-response",
               let id = payload["id"] as? Int,
-              let continuation = pendingRequests.removeValue(forKey: id) else { return }
+              let continuation = pendingRequests.removeValue(for: id) else { return }
 
         if payload["ok"] as? Bool == true {
             continuation.resume(returning: payload["body"] as? [String: Any] ?? [:])
