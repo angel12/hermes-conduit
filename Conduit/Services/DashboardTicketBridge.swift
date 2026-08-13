@@ -183,12 +183,17 @@ final class DashboardTicketBridge: NSObject {
     private var isReady = false
     private var isInvalidated = false
     private var requestID = 0
-    private let pendingRequests = DashboardTicketBridgePendingRequests()
+    private let pendingRequests: DashboardTicketBridgePendingRequests
 
-    init(baseURL: String, cloudflareAccess: CloudflareAccessCredentials? = nil) {
+    init(
+        baseURL: String,
+        cloudflareAccess: CloudflareAccessCredentials? = nil,
+        pendingRequests: DashboardTicketBridgePendingRequests = DashboardTicketBridgePendingRequests()
+    ) {
         let normalizedBaseURL = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL)) ?? ""
         self.baseURL = normalizedBaseURL
         self.cloudflareAccess = cloudflareAccess
+        self.pendingRequests = pendingRequests
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
         if let script = cloudflareAccess?.fetchInjectionUserScript(expectedBaseURL: normalizedBaseURL), !script.isEmpty {

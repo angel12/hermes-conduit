@@ -35,6 +35,19 @@ final class MarkdownFallbackTests: XCTestCase {
         )
     }
 
+    func testResolvePreservesEncodedPathWhenAnotherComponentNeedsRepair() throws {
+        let destination = try XCTUnwrap(
+            WebFallbackImageDestination.resolve(
+                "https://example.com/assets/a%2Fb.png?caption=bad value"
+            )
+        )
+
+        XCTAssertEqual(
+            destination.absoluteString,
+            "https://example.com/assets/a%2Fb.png?caption=bad%20value"
+        )
+    }
+
     func testResolveRejectsMissingHostAndUnsupportedScheme() {
         XCTAssertNil(WebFallbackImageDestination.resolve("https:///image.png"))
         XCTAssertNil(WebFallbackImageDestination.resolve("javascript:alert(1)"))
@@ -61,6 +74,13 @@ final class MarkdownFallbackTests: XCTestCase {
         XCTAssertEqual(
             WebFallbackImageLabel.title(alt: "", destinationAvailable: true),
             "Open image"
+        )
+    }
+
+    func testLinkedImageWithAltRetainsAccessibleDescription() {
+        XCTAssertEqual(
+            WebFallbackImageLabel.title(alt: "Sunset over the bay", destinationAvailable: true),
+            "Sunset over the bay — image unavailable; open source"
         )
     }
 }

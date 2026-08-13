@@ -880,8 +880,9 @@ enum WebFallbackImageDestination {
               scheme == "http" || scheme == "https",
               let host = components.host,
               !host.isEmpty,
+              let rawComponents = rawComponents(from: value),
               let encodedPath = encodedComponent(
-                  components.path,
+                  rawComponents.path,
                   allowedCharacters: .urlPathAllowed
               ) else {
             return nil
@@ -889,7 +890,7 @@ enum WebFallbackImageDestination {
 
         components.scheme = scheme
         components.percentEncodedPath = encodedPath
-        if let query = components.query {
+        if let query = rawComponents.query {
             guard let encodedQuery = encodedComponent(
                 query,
                 allowedCharacters: .urlQueryAllowed
@@ -898,7 +899,7 @@ enum WebFallbackImageDestination {
         } else {
             components.percentEncodedQuery = nil
         }
-        if let fragment = components.fragment {
+        if let fragment = rawComponents.fragment {
             guard let encodedFragment = encodedComponent(
                 fragment,
                 allowedCharacters: .urlFragmentAllowed
@@ -909,6 +910,52 @@ enum WebFallbackImageDestination {
         }
 
         return isValidWebDestination(components.url) ? components.url : nil
+    }
+
+    private struct RawComponents {
+        let path: String
+        let query: String?
+        let fragment: String?
+    }
+
+    /// URLComponents exposes a decoded `path` when a URL has another invalid
+    /// component. Reading that value would turn an existing `%2F` into `/`
+    /// while repairing, so split the original string before encoding each
+    /// component instead.
+    private static func rawComponents(from value: String) -> RawComponents? {
+        guard let schemeEnd = value.firstIndex(of: ":") else { return nil }
+        let authorityStart = value.index(after: schemeEnd)
+        guard value[authorityStart...].hasPrefix("//") else { return nil }
+
+        let suffixStart = value.index(authorityStart, offsetBy: 2)
+        guard let firstDelimiter = value[suffixStart...].firstIndex(where: { character in
+            character == "/" || character == "?" || character == "#"
+        }) else {
+            return RawComponents(path: "", query: nil, fragment: nil)
+        }
+
+        let suffix = value[firstDelimiter...]
+        let queryDelimiter = suffix.firstIndex(of: "?")
+        let fragmentDelimiter = suffix.firstIndex(of: "#")
+        let pathEnd = [queryDelimiter, fragmentDelimiter]
+            .compactMap { $0 }
+            .min() ?? suffix.endIndex
+        let path = String(suffix[..<pathEnd])
+
+        let query: String?
+        if let queryDelimiter,
+           fragmentDelimiter.map({ queryDelimiter < $0 }) ?? true {
+            let queryEnd = fragmentDelimiter ?? suffix.endIndex
+            query = String(suffix[suffix.index(after: queryDelimiter)..<queryEnd])
+        } else {
+            query = nil
+        }
+
+        let fragment = fragmentDelimiter.map { delimiter in
+            String(suffix[suffix.index(after: delimiter)...])
+        }
+
+        return RawComponents(path: path, query: query, fragment: fragment)
     }
 
     private static func isValidWebDestination(_ url: URL?) -> Bool {
@@ -970,7 +1017,7 @@ enum WebFallbackImageDestination {
 enum WebFallbackImageLabel {
     static func title(alt: String, destinationAvailable: Bool) -> String {
         if destinationAvailable {
-            return alt.isEmpty ? "Open image" : "Image unavailable — open source"
+            return alt.isEmpty ? "Open image" : "\(alt) — image unavailable; open source"
         }
         return alt.isEmpty ? "Image unavailable" : "\(alt) unavailable"
     }
