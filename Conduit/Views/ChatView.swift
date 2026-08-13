@@ -323,9 +323,12 @@ struct ChatView: View {
                     }
                     guard !keysAreEquivalent else { return }
                     topVisibleChatID = nil
-                    followsLatest = ChatFollowLatestRelatchPolicy
+                    let shouldFollowLatest = ChatFollowLatestRelatchPolicy
                         .shouldFollowLatestAfterTransition(isDragging: isDraggingChat)
-                    scrollToLatest(using: proxy)
+                    followsLatest = shouldFollowLatest
+                    if shouldFollowLatest {
+                        scrollToLatest(using: proxy)
+                    }
                 }
                 .onChange(of: appState.activeProfile) { _, _ in
                     invalidateChatDrag()
@@ -351,9 +354,12 @@ struct ChatView: View {
                         return
                     }
                     guard oldKey != newKey else { return }
-                    followsLatest = ChatFollowLatestRelatchPolicy
+                    let shouldFollowLatest = ChatFollowLatestRelatchPolicy
                         .shouldFollowLatestAfterTransition(isDragging: isDraggingChat)
-                    scrollToLatest(using: proxy)
+                    followsLatest = shouldFollowLatest
+                    if shouldFollowLatest {
+                        scrollToLatest(using: proxy)
+                    }
                 }
                 .onChange(of: appState.activeChatScrollSessionIdentity) { _, _ in
                     guard !appState.isOpeningNotificationSession else { return }
@@ -698,8 +704,10 @@ struct ChatView: View {
         notificationHandoffPending = false
         notificationHandoffSessionKey = nil
         cancelAutomaticRestoration()
-        followsLatest = ChatFollowLatestRelatchPolicy
+        let shouldFollowLatest = ChatFollowLatestRelatchPolicy
             .shouldFollowLatestAfterTransition(isDragging: isDraggingChat)
+        followsLatest = shouldFollowLatest
+        guard shouldFollowLatest else { return }
         var transaction = Transaction()
         transaction.animation = nil
         withTransaction(transaction) {
