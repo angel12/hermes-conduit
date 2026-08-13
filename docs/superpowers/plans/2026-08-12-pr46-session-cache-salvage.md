@@ -4,7 +4,7 @@
 
 **Goal:** Update PR #46 onto current `main` while retaining only its session-catalog cache invalidation behavior.
 
-**Architecture:** Use a non-rewriting merge of current `origin/main` into the contributor-owned PR branch. Current `main` remains authoritative for the already-merged stream, WebSocket, WebKit, rendering-cache, and image-fallback code; PR #46 contributes only its AppState cache purge logic. The existing AppState caches are private and have no suitable integration seam, so verification will rely on the effective diff plus the full iOS test suite rather than adding test-only production hooks.
+**Architecture:** Use a non-rewriting merge of current `origin/main` into the contributor-owned PR branch. Current `main` remains authoritative for the already-merged stream, WebSocket, WebKit, rendering-cache, and image-fallback code; PR #46 contributes its AppState cache invalidation and generation-checked commit logic. The cache remains private to `AppState`; the standalone cache value type provides focused coverage for stale write rejection without adding a test-only production hook, while the end-to-end WebKit-backed delete/archive flow remains an integration boundary outside the unit-test seam.
 
 **Tech Stack:** Swift 5.9, SwiftUI, XCTest, XcodeGen, Xcode 26.5, iOS Simulator.
 
@@ -26,20 +26,23 @@
 
 **Interfaces:**
 - Consumes: `origin/main` at the current PR #45 merge commit.
-- Produces: A merge commit whose first parent is current `origin/main` and whose effective PR diff contains the cache invalidation plus the approved design/plan documents.
+- Produces: A merge commit whose second parent is current `origin/main` and whose effective PR diff contains the cache invalidation, generation guard, focused test, and approved design/plan documents.
 
 - [ ] **Step 1: Confirm the worktree is clean and the source refs are current**
 
 Run:
 
 ```bash
+git fetch origin main --prune
 git status --short --branch
 git rev-parse origin/main
 git rev-parse HEAD
 ```
 
 Expected: only committed salvage documentation is present; `origin/main` is
-`725610341c75bab7acf84e2de7f4dcc9549aa24d` or a newer fetched `main` commit.
+the current fetched `main` commit. The original checkpoint
+`725610341c75bab7acf84e2de7f4dcc9549aa24d` is historical context, not a
+freshness guarantee.
 
 - [ ] **Step 2: Merge current main without rewriting history**
 
@@ -54,16 +57,15 @@ stability code and reapply only these PR #46 behaviors in `AppState.swift`:
 
 ```swift
 cronSessions = []
-profileSessionCache.removeAll()
-loadedFullSessionHistory.removeAll()
+sessionCatalogCache.removeAll()
 ```
 
 and the cache-row removal in `removeSessionFromLiveCatalog`:
 
 ```swift
-for key in profileSessionCache.keys {
-    profileSessionCache[key]?.removeAll { sessionMatches($0, session) }
-}
+sessionCatalogCache.removeSession(
+    withIDs: Set([session.id] + session.alternateIds)
+)
 ```
 
 - [ ] **Step 3: Confirm the effective diff is reduced to the intended scope**
@@ -76,8 +78,9 @@ git diff origin/main...HEAD -- Conduit/Services/AppState.swift
 ```
 
 Expected: no stale PR #46 replacements of the current deduplication, bridge,
-WebSocket, cache, or image-fallback implementations; only the cache purge and
-the committed salvage documentation remain different from `main`.
+WebSocket, rendering-cache, or image-fallback implementations; only the cache
+invalidation, generation guard, focused test, and committed salvage
+documentation remain different from `main`.
 
 - [ ] **Step 4: Commit any conflict resolution**
 
@@ -98,20 +101,22 @@ Skip the commit command when `git merge` already created the merge commit.
 
 **Interfaces:**
 - Consumes: The reduced effective diff from Task 1.
-- Produces: A verified decision that the private cache behavior is covered by existing integration paths, or a narrowly scoped test only if an existing seam can exercise it without exposing private state.
+- Produces: Focused coverage for rejecting a stale cache commit after a
+  destructive mutation, with the WebKit-backed delete/archive integration
+  boundary explicitly recorded as unverified by unit tests.
 
 - [ ] **Step 1: Check existing test seams before adding coverage**
 
 Run:
 
 ```bash
-rg -n -C 8 "profileSessionCache|loadedFullSessionHistory|removeSessionFromLiveCatalog|disconnect\(" ConduitTests Conduit/Services/AppState.swift
+rg -n -C 8 "sessionCatalogCache|SessionCatalogCache|removeSessionFromLiveCatalog|disconnect\(" ConduitTests Conduit/Services/AppState.swift
 ```
 
-Expected: do not change production visibility merely to inspect private cache
-storage. If no existing seam can observe cache reuse after delete/archive or
-disconnect/re-sign-in, record that no focused test is added and rely on the
-full suite for regression protection.
+Expected: do not change `AppState` production visibility merely to inspect
+private cache storage. Keep the focused test at the cache commit boundary and
+record that the WebKit-backed delete/archive and disconnect/re-sign-in flows
+remain integration boundaries not exercised by the unit-test harness.
 
 - [ ] **Step 2: Check the reduced diff for accidental behavior changes**
 
@@ -119,11 +124,12 @@ Run:
 
 ```bash
 git diff --check
+git diff --check origin/main...HEAD
 git diff --stat origin/main...HEAD
 ```
 
-Expected: no whitespace errors and no files outside the approved AppState and
-salvage-document scope.
+Expected: no whitespace errors and no files outside the approved AppState,
+focused-test, and salvage-document scope.
 
 ### Task 3: Run full verification
 
@@ -140,11 +146,12 @@ salvage-document scope.
 Run:
 
 ```bash
+DESTINATION="${DESTINATION:-platform=iOS Simulator,name=iPhone 17 Pro,OS=26.5}"
 xcodegen generate
 xcodebuild test \
   -project Conduit.xcodeproj \
   -scheme Conduit \
-  -destination "platform=iOS Simulator,id=6930ECCE-D36C-4E11-8AB5-EDEC4DEA8355" \
+  -destination "$DESTINATION" \
   -configuration Debug \
   -resultBundlePath /tmp/conduit-pr46-salvage.xcresult \
   CODE_SIGN_IDENTITY="" \
@@ -153,6 +160,8 @@ xcodebuild test \
   DEVELOPMENT_TEAM="" \
   PROVISIONING_PROFILE_SPECIFIER=""
 ```
+
+Set `DESTINATION` to another available simulator name and runtime when needed.
 
 - [ ] **Step 2: Read the result summary**
 
