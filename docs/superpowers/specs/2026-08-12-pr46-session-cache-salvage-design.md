@@ -20,7 +20,8 @@ owned by the contributor fork.
      later sign-in performs an authoritative reload.
    - reject stale catalog commits after an interleaved mutation, abort when
      the profile/client/bridge context changes, and bound retries;
-   - preserve cron cache entries when refresh requests fail;
+   - preserve cron cache entries when refresh requests fail and refresh them
+     after a bounded per-key cache lifetime;
    - replace cached live rows after meaningful complete catalog responses with
      trustworthy terminal metadata and periodically refresh partial catalogs
      so remote deletions do not remain indefinitely; empty, unusable, or
@@ -46,8 +47,10 @@ or ambiguous responses without terminal metadata are non-authoritative and may
 merge older cached rows; they do not record a fresh full-history marker.
 Responses capped at the available page limit are treated as partial and may
 merge older cached rows; the full catalog is refreshed after a bounded cache
-lifetime. A failed cron refresh leaves its prior cache entry untouched and is
-retried by the next load.
+lifetime. Cron uses its own marker, so a normal load eventually revalidates
+remotely deleted cron rows without forcing the whole session list. A failed
+cron refresh leaves its prior cache entry untouched and is retried by the next
+load.
 
 ## Verification
 

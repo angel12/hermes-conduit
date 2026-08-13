@@ -13,8 +13,7 @@ final class SessionCatalogCacheTests: XCTestCase {
                 liveKey: "default:exclude",
                 cronSessions: [],
                 cronKey: "default:cron",
-                loadedFullHistoryKey: "default:exclude",
-                recordFullHistoryAt: Date(timeIntervalSince1970: 100),
+                historyMarkers: ["default:exclude": Date(timeIntervalSince1970: 100)],
                 at: loadGeneration
             )
         )
@@ -27,8 +26,7 @@ final class SessionCatalogCacheTests: XCTestCase {
                 liveKey: "default:exclude",
                 cronSessions: [],
                 cronKey: "default:cron",
-                loadedFullHistoryKey: "default:exclude",
-                recordFullHistoryAt: Date(timeIntervalSince1970: 100),
+                historyMarkers: ["default:exclude": Date(timeIntervalSince1970: 100)],
                 at: loadGeneration
             )
         )
@@ -50,8 +48,7 @@ final class SessionCatalogCacheTests: XCTestCase {
                 liveKey: "default:exclude",
                 cronSessions: [],
                 cronKey: "default:cron",
-                loadedFullHistoryKey: "default:exclude",
-                recordFullHistoryAt: Date(timeIntervalSince1970: 100),
+                historyMarkers: ["default:exclude": Date(timeIntervalSince1970: 100)],
                 at: generation
             )
         )
@@ -71,8 +68,7 @@ final class SessionCatalogCacheTests: XCTestCase {
                 liveKey: "default:exclude",
                 cronSessions: [],
                 cronKey: "default:cron",
-                loadedFullHistoryKey: "default:exclude",
-                recordFullHistoryAt: Date(timeIntervalSince1970: 100),
+                historyMarkers: ["default:exclude": Date(timeIntervalSince1970: 100)],
                 at: cache.mutationGeneration
             )
         )
@@ -95,8 +91,7 @@ final class SessionCatalogCacheTests: XCTestCase {
                 liveKey: "default:exclude",
                 cronSessions: [],
                 cronKey: "default:cron",
-                loadedFullHistoryKey: "default:exclude",
-                recordFullHistoryAt: Date(timeIntervalSince1970: 100),
+                historyMarkers: ["default:exclude": Date(timeIntervalSince1970: 100)],
                 at: cache.mutationGeneration
             )
         )
@@ -106,8 +101,7 @@ final class SessionCatalogCacheTests: XCTestCase {
                 liveKey: "default:exclude",
                 cronSessions: [],
                 cronKey: "default:cron",
-                loadedFullHistoryKey: "default:exclude",
-                recordFullHistoryAt: Date(timeIntervalSince1970: 200),
+                historyMarkers: ["default:exclude": Date(timeIntervalSince1970: 200)],
                 at: cache.mutationGeneration
             )
         )
@@ -125,8 +119,7 @@ final class SessionCatalogCacheTests: XCTestCase {
                 liveKey: "default:exclude",
                 cronSessions: [],
                 cronKey: "default:cron",
-                loadedFullHistoryKey: "default:exclude",
-                recordFullHistoryAt: Date(timeIntervalSince1970: 100),
+                historyMarkers: ["default:exclude": Date(timeIntervalSince1970: 100)],
                 at: cache.mutationGeneration
             )
         )
@@ -151,8 +144,7 @@ final class SessionCatalogCacheTests: XCTestCase {
                 liveKey: "default:exclude",
                 cronSessions: nil,
                 cronKey: "default:cron",
-                loadedFullHistoryKey: "default:exclude",
-                recordFullHistoryAt: Date(timeIntervalSince1970: 100),
+                historyMarkers: ["default:exclude": Date(timeIntervalSince1970: 100)],
                 at: cache.mutationGeneration
             )
         )
@@ -171,8 +163,7 @@ final class SessionCatalogCacheTests: XCTestCase {
                 liveKey: "default:exclude",
                 cronSessions: [],
                 cronKey: "default:cron",
-                loadedFullHistoryKey: "default:exclude",
-                recordFullHistoryAt: loadedAt,
+                historyMarkers: ["default:exclude": loadedAt],
                 at: cache.mutationGeneration
             )
         )
@@ -187,6 +178,37 @@ final class SessionCatalogCacheTests: XCTestCase {
         XCTAssertTrue(
             cache.shouldLoadFullHistory(
                 forKey: "default:exclude",
+                forceRefresh: false,
+                now: loadedAt.addingTimeInterval(SessionCatalogCache.fullHistoryRefreshInterval + 1)
+            )
+        )
+    }
+
+    func testCronHistoryRefreshesAfterCacheLifetime() {
+        var cache = SessionCatalogCache()
+        let loadedAt = Date(timeIntervalSince1970: 100)
+
+        XCTAssertTrue(
+            cache.commit(
+                liveSessions: [],
+                liveKey: "default:exclude",
+                cronSessions: [session(id: "cron-id", title: "Cron")],
+                cronKey: "default:cron",
+                historyMarkers: ["default:cron": loadedAt],
+                at: cache.mutationGeneration
+            )
+        )
+
+        XCTAssertFalse(
+            cache.shouldLoadFullHistory(
+                forKey: "default:cron",
+                forceRefresh: false,
+                now: loadedAt.addingTimeInterval(1)
+            )
+        )
+        XCTAssertTrue(
+            cache.shouldLoadFullHistory(
+                forKey: "default:cron",
                 forceRefresh: false,
                 now: loadedAt.addingTimeInterval(SessionCatalogCache.fullHistoryRefreshInterval + 1)
             )

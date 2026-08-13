@@ -175,8 +175,7 @@ struct SessionCatalogCache {
         liveKey: String,
         cronSessions: [SessionSummary]?,
         cronKey: String,
-        loadedFullHistoryKey: String,
-        recordFullHistoryAt: Date?,
+        historyMarkers: [String: Date],
         at generation: UInt64
     ) -> Bool {
         guard generation == mutationGeneration else { return false }
@@ -184,9 +183,9 @@ struct SessionCatalogCache {
         if let cronSessions {
             sessionsByKey[cronKey] = cronSessions
         }
-        if let recordFullHistoryAt {
-            loadedFullHistoryKeys.insert(loadedFullHistoryKey)
-            fullHistoryLoadedAt[loadedFullHistoryKey] = recordFullHistoryAt
+        for (key, loadedAt) in historyMarkers {
+            loadedFullHistoryKeys.insert(key)
+            fullHistoryLoadedAt[key] = loadedAt
         }
         return true
     }
@@ -4871,14 +4870,19 @@ final class AppState: ObservableObject {
                     let merged = uniqueSessions(scoped + cached)
 
                     // Fetch cron sessions separately -- the main query excludes them.
+                    let shouldLoadCron = sessionCatalogCache.shouldLoadFullHistory(
+                        forKey: cronKey,
+                        forceRefresh: forceRefresh
+                    )
                     let cachedCronSessions = sessionCatalogCache.cachedSessions(forKey: cronKey)?.filter {
                         sessionBelongsToProfile($0, profile: profile)
                     }
                     let publishedCronSnapshot = self.cronSessions.filter {
                         sessionBelongsToProfile($0, profile: profile)
                     }
+                    var didFetchCronSessions = false
                     let cronSessions: [SessionSummary]?
-                    if !forceRefresh, let cachedCronSessions {
+                    if !shouldLoadCron, let cachedCronSessions {
                         cronSessions = cachedCronSessions
                     } else {
                         do {
@@ -4888,6 +4892,7 @@ final class AppState: ObservableObject {
                             ).filter {
                                 sessionBelongsToProfile($0, profile: profile)
                             }
+                            didFetchCronSessions = true
                         } catch {
                             // Keep a previous cron snapshot if one exists, but
                             // do not cache an empty result for a failed request.
@@ -4908,13 +4913,19 @@ final class AppState: ObservableObject {
                         merged + (cronSessions ?? cachedCronSessions ?? publishedCronSnapshot)
                     )
                     if !combined.isEmpty || shouldLoadHistory == false {
+                        var historyMarkers: [String: Date] = [:]
+                        if scopedResult.isAuthoritative && !scoped.isEmpty {
+                            historyMarkers[cacheKey] = Date()
+                        }
+                        if didFetchCronSessions {
+                            historyMarkers[cronKey] = Date()
+                        }
                         guard sessionCatalogCache.commit(
                             liveSessions: combined,
                             liveKey: cacheKey,
                             cronSessions: cronSessions,
                             cronKey: cronKey,
-                            loadedFullHistoryKey: cacheKey,
-                            recordFullHistoryAt: scopedResult.isAuthoritative && !scoped.isEmpty ? Date() : nil,
+                            historyMarkers: historyMarkers,
                             at: generation
                         ) else {
                             catalogRetryCount += 1
