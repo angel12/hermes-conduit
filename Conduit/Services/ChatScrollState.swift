@@ -35,6 +35,26 @@ enum ChatMessageScrollUpdatePolicy {
     }
 }
 
+enum ChatFollowLatestRelatchPolicy {
+    static func shouldRelatch(
+        isNearBottom: Bool,
+        hasPendingRestoration: Bool,
+        isDragging: Bool
+    ) -> Bool {
+        isNearBottom && !hasPendingRestoration && !isDragging
+    }
+
+    @MainActor
+    static func relatchAfterDragEnds(
+        isDragging: () -> Bool,
+        relatch: () -> Void
+    ) async {
+        await Task.yield()
+        guard !isDragging() else { return }
+        relatch()
+    }
+}
+
 struct ChatMessageScrollTargetCache: Equatable {
     private(set) var targets: [ChatMessageScrollTarget] = []
     private(set) var renderingRevision: UInt64 = 0

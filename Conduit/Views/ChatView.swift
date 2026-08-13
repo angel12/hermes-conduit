@@ -383,6 +383,12 @@ struct ChatView: View {
                         }
                         .onEnded { _ in
                             isDraggingChat = false
+                            Task { @MainActor in
+                                await ChatFollowLatestRelatchPolicy.relatchAfterDragEnds(
+                                    isDragging: { isDraggingChat },
+                                    relatch: { relatchFollowsLatestIfSettled() }
+                                )
+                            }
                             saveChatScrollPosition(for: renderedScrollSessionKey)
                             appState.flushChatResumeViewport()
                         }
@@ -649,7 +655,11 @@ struct ChatView: View {
     /// near-bottom window each streamed delta would yank the scroll back to
     /// the bottom, fighting the drag.
     private func relatchFollowsLatestIfSettled() {
-        if isNearBottom && !hasPendingRestoration && !isDraggingChat {
+        if ChatFollowLatestRelatchPolicy.shouldRelatch(
+            isNearBottom: isNearBottom,
+            hasPendingRestoration: hasPendingRestoration,
+            isDragging: isDraggingChat
+        ) {
             followsLatest = true
         }
     }

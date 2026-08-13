@@ -2,6 +2,56 @@ import XCTest
 @testable import Conduit
 
 final class ChatScrollStateTests: XCTestCase {
+    func testFollowLatestRelatchIsBlockedWhileDraggingNearBottom() {
+        XCTAssertFalse(
+            ChatFollowLatestRelatchPolicy.shouldRelatch(
+                isNearBottom: true,
+                hasPendingRestoration: false,
+                isDragging: true
+            )
+        )
+    }
+
+    func testFollowLatestRelatchIsAllowedAfterSettledDragEnds() {
+        XCTAssertTrue(
+            ChatFollowLatestRelatchPolicy.shouldRelatch(
+                isNearBottom: true,
+                hasPendingRestoration: false,
+                isDragging: false
+            )
+        )
+    }
+
+    @MainActor
+    func testDragEndRelatchIsCancelledWhenAnotherDragStarts() async {
+        var isDragging = false
+        var relatchCount = 0
+
+        let scheduledRelatch = Task { @MainActor in
+            await ChatFollowLatestRelatchPolicy.relatchAfterDragEnds(
+                isDragging: { isDragging },
+                relatch: { relatchCount += 1 }
+            )
+        }
+        isDragging = true
+
+        await scheduledRelatch.value
+
+        XCTAssertEqual(relatchCount, 0)
+    }
+
+    @MainActor
+    func testDragEndRelatchRunsAfterSettledDragEnds() async {
+        var relatchCount = 0
+
+        await ChatFollowLatestRelatchPolicy.relatchAfterDragEnds(
+            isDragging: { false },
+            relatch: { relatchCount += 1 }
+        )
+
+        XCTAssertEqual(relatchCount, 1)
+    }
+
     func testRestorationWaitsForMatchingRenderedTargetAndGeometryConfirmation() {
         let sessionA = ChatScrollSessionKey(profile: "default", sessionID: "session-a")
         let sessionB = ChatScrollSessionKey(profile: "default", sessionID: "session-b")
