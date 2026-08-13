@@ -22,8 +22,9 @@ struct ChatView: View {
     @State private var renderedTranscriptRevision: UInt64 = 0
     @State private var renderedViewportTransitionGeneration: UInt64 = 0
     @State private var viewportSnapshotProviderID = UUID()
-    @State private var isDraggingChat = false
-    @State private var chatDragGeneration: UInt64 = 0
+    @GestureState private var isDraggingChat = false
+    @State private var chatDragLifecycle = ChatDragLifecycleState()
+    @State private var chatDragCompletionToken: ChatDragCompletionToken?
     @State private var notificationHandoffPending = false
     @State private var notificationHandoffSessionKey: ChatScrollSessionKey?
     @State private var notificationHandoffHasMeasuredLayout = false
@@ -204,11 +205,17 @@ struct ChatView: View {
                     )
                 }
                 .onDisappear {
+                    abandonChatDrag()
                     appState.removeChatViewportSnapshotProvider(id: viewportSnapshotProviderID)
                 }
                 .task(id: appState.chatResumeRestorationRequest?.generation) {
                     guard let request = appState.chatResumeRestorationRequest else { return }
+                    invalidateChatDrag()
                     await applyChatResumeRestoration(request, using: proxy)
+                }
+                .task(id: chatDragCompletionToken) {
+                    guard let completed = chatDragCompletionToken else { return }
+                    await completeChatDrag(completed)
                 }
                 .onPreferenceChange(ChatBottomMarkerPreferenceKey.self) { value in
                     updateBottomMarker(value)
@@ -233,6 +240,10 @@ struct ChatView: View {
                 }
                 .onPreferenceChange(ChatRenderedScrollTargetsPreferenceKey.self) { value in
                     renderedScrollTargets = value
+                }
+                .onChange(of: isDraggingChat) { wasDragging, isDragging in
+                    guard wasDragging, !isDragging else { return }
+                    chatDragCompletionToken = chatDragLifecycle.finish()
                 }
                 .onChange(of: appState.messages) { _, newMessages in
                     let cacheUpdate = chatMessageScrollTargetCache.update(for: newMessages)
@@ -277,12 +288,14 @@ struct ChatView: View {
                     saveChatScrollPosition(for: renderedScrollSessionKey)
                 }
                 .onChange(of: appState.chatScrollRequest) { _, _ in
+                    invalidateChatDrag()
                     cancelAutomaticRestoration()
                     followsLatest = true
                     scrollToLatest(using: proxy)
                 }
                 .onChange(of: appState.activeSessionId) { oldSessionID, newSessionID in
                     guard !appState.isOpeningNotificationSession else {
+                        invalidateChatDrag()
                         cancelAutomaticRestoration()
                         notificationHandoffPending = true
                         notificationHandoffSessionKey = activeScrollSessionKey
@@ -301,6 +314,9 @@ struct ChatView: View {
                         cancelAutomaticRestoration()
                     }
                     let keysAreEquivalent = identity.areEquivalent(oldKey, newKey)
+                    if !keysAreEquivalent {
+                        invalidateChatDrag()
+                    }
                     renderedScrollSessionKey = newKey
                     if followsLatest {
                         renderedViewportTransitionGeneration = appState.chatViewportTransitionGeneration
@@ -311,6 +327,7 @@ struct ChatView: View {
                     scrollToLatest(using: proxy)
                 }
                 .onChange(of: appState.activeProfile) { _, _ in
+                    invalidateChatDrag()
                     let oldKey = renderedScrollSessionKey
                     let newKey = activeScrollSessionKey
                     if let request = appState.chatResumeRestorationRequest,
@@ -348,6 +365,7 @@ struct ChatView: View {
                 }
                 .onChange(of: appState.isOpeningNotificationSession) { _, isOpening in
                     if isOpening {
+                        invalidateChatDrag()
                         cancelAutomaticRestoration()
                         notificationHandoffPending = true
                         notificationHandoffSessionKey = nil
@@ -371,40 +389,7 @@ struct ChatView: View {
                         scrollToLatest(using: proxy)
                     }
                 }
-                .simultaneousGesture(
-                    DragGesture(minimumDistance: 3)
-                        .onChanged { _ in
-                            // Only a deliberate user drag opts out of the
-                            // stream-following behavior. Content growth alone
-                            // must not make a live conversation appear stale.
-                            guard !isDraggingChat else { return }
-                            chatDragGeneration &+= 1
-                            isDraggingChat = true
-                            cancelAutomaticRestoration()
-                            followsLatest = false
-                        }
-                        .onEnded { _ in
-                            isDraggingChat = false
-                            let completedGeneration = chatDragGeneration
-                            let completedSessionKey = renderedScrollSessionKey ?? activeScrollSessionKey
-                            Task { @MainActor in
-                                await ChatFollowLatestRelatchPolicy.completeDragAfterYield(
-                                    isCurrent: {
-                                        !isDraggingChat
-                                            && chatDragGeneration == completedGeneration
-                                            && (renderedScrollSessionKey ?? activeScrollSessionKey) == completedSessionKey
-                                            && !notificationHandoffPending
-                                            && !appState.isOpeningNotificationSession
-                                    },
-                                    relatch: { relatchFollowsLatestIfSettled() },
-                                    persist: {
-                                        saveChatScrollPosition(for: completedSessionKey)
-                                        appState.flushChatResumeViewport()
-                                    }
-                                )
-                            }
-                        }
-                )
+                .simultaneousGesture(chatDragGesture)
                 .overlay(alignment: .bottomTrailing) {
                     if !followsLatest && !isNearBottom {
                         Button {
@@ -444,7 +429,11 @@ struct ChatView: View {
     }
 
     private func saveChatScrollPosition(for preferredKey: ChatScrollSessionKey? = nil) {
-        guard let sessionKey = preferredKey ?? renderedScrollSessionKey ?? activeScrollSessionKey else { return }
+        let currentKey = preferredKey ?? renderedScrollSessionKey ?? activeScrollSessionKey
+        guard let sessionKey = ChatFollowLatestRelatchPolicy.persistenceSessionKey(
+            currentKey: currentKey,
+            identity: appState.activeChatScrollSessionIdentity
+        ) else { return }
         guard let snapshot = currentChatViewportSnapshot() else { return }
         appState.recordChatViewport(snapshot, for: sessionKey)
     }
@@ -464,6 +453,70 @@ struct ChatView: View {
 
     private func cancelAutomaticRestoration() {
         appState.cancelChatResumeRestoration()
+    }
+
+    private var chatDragGesture: some Gesture {
+        DragGesture(minimumDistance: 3)
+            .updating($isDraggingChat) { _, isDragging, _ in
+                isDragging = true
+            }
+            .onChanged { _ in
+                beginChatDragIfNeeded()
+            }
+    }
+
+    private func beginChatDragIfNeeded() {
+        // Only a deliberate user drag opts out of stream following. Capturing
+        // here preserves the session and transition that owned the gesture.
+        guard chatDragLifecycle.begin(
+            sessionKey: renderedScrollSessionKey ?? activeScrollSessionKey,
+            viewportTransitionGeneration: appState.chatViewportTransitionGeneration
+        ) else { return }
+        chatDragCompletionToken = nil
+        cancelAutomaticRestoration()
+        followsLatest = false
+    }
+
+    @MainActor
+    private func completeChatDrag(_ completed: ChatDragCompletionToken) async {
+        await ChatFollowLatestRelatchPolicy.completeDragAfterNextTurn(
+            isCurrent: {
+                ChatFollowLatestRelatchPolicy.isCompletionCurrent(
+                    completed: completed,
+                    current: currentChatDragCompletionToken,
+                    identity: appState.activeChatScrollSessionIdentity,
+                    isDragging: isDraggingChat,
+                    hasPendingRestoration: hasPendingRestoration,
+                    hasNotificationHandoff: appState.isOpeningNotificationSession
+                        || notificationHandoffPending
+                )
+            },
+            relatch: { relatchFollowsLatestIfSettled() },
+            persist: {
+                saveChatScrollPosition(for: currentChatDragCompletionToken.sessionKey)
+                appState.flushChatResumeViewport()
+            }
+        )
+        guard !Task.isCancelled,
+              chatDragCompletionToken == completed else { return }
+        chatDragCompletionToken = nil
+    }
+
+    private var currentChatDragCompletionToken: ChatDragCompletionToken {
+        chatDragLifecycle.currentToken(
+            sessionKey: renderedScrollSessionKey ?? activeScrollSessionKey,
+            viewportTransitionGeneration: appState.chatViewportTransitionGeneration
+        )
+    }
+
+    private func invalidateChatDrag() {
+        chatDragLifecycle.invalidate(hasActiveGesture: isDraggingChat)
+        chatDragCompletionToken = nil
+    }
+
+    private func abandonChatDrag() {
+        chatDragLifecycle.abandon()
+        chatDragCompletionToken = nil
     }
 
     @MainActor
