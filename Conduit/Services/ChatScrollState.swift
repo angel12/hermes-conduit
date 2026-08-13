@@ -39,19 +39,28 @@ enum ChatFollowLatestRelatchPolicy {
     static func shouldRelatch(
         isNearBottom: Bool,
         hasPendingRestoration: Bool,
+        hasNotificationHandoff: Bool,
         isDragging: Bool
     ) -> Bool {
-        isNearBottom && !hasPendingRestoration && !isDragging
+        isNearBottom
+            && !hasPendingRestoration
+            && !hasNotificationHandoff
+            && !isDragging
     }
 
+    /// Defers completion until gesture state from the current actor turn has
+    /// settled. A newer drag or transcript transition invalidates the work via
+    /// `isCurrent`; otherwise persistence runs after the relatch decision.
     @MainActor
-    static func relatchAfterDragEnds(
-        isDragging: () -> Bool,
-        relatch: () -> Void
+    static func completeDragAfterYield(
+        isCurrent: () -> Bool,
+        relatch: () -> Void,
+        persist: () -> Void
     ) async {
         await Task.yield()
-        guard !isDragging() else { return }
+        guard isCurrent() else { return }
         relatch()
+        persist()
     }
 }
 

@@ -23,6 +23,7 @@ struct ChatView: View {
     @State private var renderedViewportTransitionGeneration: UInt64 = 0
     @State private var viewportSnapshotProviderID = UUID()
     @State private var isDraggingChat = false
+    @State private var chatDragGeneration: UInt64 = 0
     @State private var notificationHandoffPending = false
     @State private var notificationHandoffSessionKey: ChatScrollSessionKey?
     @State private var notificationHandoffHasMeasuredLayout = false
@@ -377,20 +378,31 @@ struct ChatView: View {
                             // stream-following behavior. Content growth alone
                             // must not make a live conversation appear stale.
                             guard !isDraggingChat else { return }
+                            chatDragGeneration &+= 1
                             isDraggingChat = true
                             cancelAutomaticRestoration()
                             followsLatest = false
                         }
                         .onEnded { _ in
                             isDraggingChat = false
+                            let completedGeneration = chatDragGeneration
+                            let completedSessionKey = renderedScrollSessionKey ?? activeScrollSessionKey
                             Task { @MainActor in
-                                await ChatFollowLatestRelatchPolicy.relatchAfterDragEnds(
-                                    isDragging: { isDraggingChat },
-                                    relatch: { relatchFollowsLatestIfSettled() }
+                                await ChatFollowLatestRelatchPolicy.completeDragAfterYield(
+                                    isCurrent: {
+                                        !isDraggingChat
+                                            && chatDragGeneration == completedGeneration
+                                            && (renderedScrollSessionKey ?? activeScrollSessionKey) == completedSessionKey
+                                            && !notificationHandoffPending
+                                            && !appState.isOpeningNotificationSession
+                                    },
+                                    relatch: { relatchFollowsLatestIfSettled() },
+                                    persist: {
+                                        saveChatScrollPosition(for: completedSessionKey)
+                                        appState.flushChatResumeViewport()
+                                    }
                                 )
                             }
-                            saveChatScrollPosition(for: renderedScrollSessionKey)
-                            appState.flushChatResumeViewport()
                         }
                 )
                 .overlay(alignment: .bottomTrailing) {
@@ -658,6 +670,8 @@ struct ChatView: View {
         if ChatFollowLatestRelatchPolicy.shouldRelatch(
             isNearBottom: isNearBottom,
             hasPendingRestoration: hasPendingRestoration,
+            hasNotificationHandoff: appState.isOpeningNotificationSession
+                || notificationHandoffPending,
             isDragging: isDraggingChat
         ) {
             followsLatest = true

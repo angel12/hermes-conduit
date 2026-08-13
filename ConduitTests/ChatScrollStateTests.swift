@@ -2,54 +2,63 @@ import XCTest
 @testable import Conduit
 
 final class ChatScrollStateTests: XCTestCase {
-    func testFollowLatestRelatchIsBlockedWhileDraggingNearBottom() {
-        XCTAssertFalse(
-            ChatFollowLatestRelatchPolicy.shouldRelatch(
-                isNearBottom: true,
-                hasPendingRestoration: false,
-                isDragging: true
-            )
-        )
-    }
+    func testFollowLatestRelatchRequiresSettledNearBottomViewport() {
+        let cases: [(
+            isNearBottom: Bool,
+            hasPendingRestoration: Bool,
+            hasNotificationHandoff: Bool,
+            isDragging: Bool,
+            expected: Bool
+        )] = [
+            (true, false, false, false, true),
+            (false, false, false, false, false),
+            (true, true, false, false, false),
+            (true, false, true, false, false),
+            (true, false, false, true, false),
+        ]
 
-    func testFollowLatestRelatchIsAllowedAfterSettledDragEnds() {
-        XCTAssertTrue(
-            ChatFollowLatestRelatchPolicy.shouldRelatch(
-                isNearBottom: true,
-                hasPendingRestoration: false,
-                isDragging: false
-            )
-        )
-    }
-
-    @MainActor
-    func testDragEndRelatchIsCancelledWhenAnotherDragStarts() async {
-        var isDragging = false
-        var relatchCount = 0
-
-        let scheduledRelatch = Task { @MainActor in
-            await ChatFollowLatestRelatchPolicy.relatchAfterDragEnds(
-                isDragging: { isDragging },
-                relatch: { relatchCount += 1 }
+        for testCase in cases {
+            XCTAssertEqual(
+                ChatFollowLatestRelatchPolicy.shouldRelatch(
+                    isNearBottom: testCase.isNearBottom,
+                    hasPendingRestoration: testCase.hasPendingRestoration,
+                    hasNotificationHandoff: testCase.hasNotificationHandoff,
+                    isDragging: testCase.isDragging
+                ),
+                testCase.expected
             )
         }
-        isDragging = true
-
-        await scheduledRelatch.value
-
-        XCTAssertEqual(relatchCount, 0)
     }
 
     @MainActor
-    func testDragEndRelatchRunsAfterSettledDragEnds() async {
-        var relatchCount = 0
+    func testDragCompletionRechecksGestureAfterYield() async {
+        var dragGeneration = 1
+        var completionEvents: [String] = []
+        let nextDrag = Task { @MainActor in
+            dragGeneration = 2
+        }
 
-        await ChatFollowLatestRelatchPolicy.relatchAfterDragEnds(
-            isDragging: { false },
-            relatch: { relatchCount += 1 }
+        await ChatFollowLatestRelatchPolicy.completeDragAfterYield(
+            isCurrent: { dragGeneration == 1 },
+            relatch: { completionEvents.append("relatch") },
+            persist: { completionEvents.append("persist") }
+        )
+        await nextDrag.value
+
+        XCTAssertEqual(completionEvents, [])
+    }
+
+    @MainActor
+    func testDragCompletionPersistsAfterRelatchDecision() async {
+        var completionEvents: [String] = []
+
+        await ChatFollowLatestRelatchPolicy.completeDragAfterYield(
+            isCurrent: { true },
+            relatch: { completionEvents.append("relatch") },
+            persist: { completionEvents.append("persist") }
         )
 
-        XCTAssertEqual(relatchCount, 1)
+        XCTAssertEqual(completionEvents, ["relatch", "persist"])
     }
 
     func testRestorationWaitsForMatchingRenderedTargetAndGeometryConfirmation() {
