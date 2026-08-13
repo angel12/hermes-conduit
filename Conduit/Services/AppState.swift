@@ -139,6 +139,19 @@ struct SessionCatalogCache {
         sessionsByKey[key]
     }
 
+    /// Preserve the previous live snapshot when the dashboard returns no
+    /// usable rows. An empty response is not safe evidence that a populated
+    /// catalog was deleted: it can also represent a transient, malformed, or
+    /// profile-mismatched response.
+    func cachedSessionsForLiveMerge(
+        remoteSessions: [SessionSummary],
+        isAuthoritative: Bool,
+        forKey key: String
+    ) -> [SessionSummary] {
+        guard !isAuthoritative || remoteSessions.isEmpty else { return [] }
+        return sessions(forKey: key)
+    }
+
     func shouldLoadFullHistory(
         forKey key: String,
         forceRefresh: Bool,
@@ -625,6 +638,9 @@ final class AppState: ObservableObject {
     /// state and any in-flight projection.
     private struct DashboardSessionCatalog {
         let sessions: [SessionSummary]
+        /// True only when the dashboard returned a meaningful, terminal
+        /// catalog. Empty or unusable responses must remain mergeable with
+        /// the previous snapshot instead of evicting it.
         let isAuthoritative: Bool
     }
 
@@ -4843,15 +4859,25 @@ final class AppState: ObservableObject {
                         sessionBelongsToProfile($0, profile: profile)
                     }
 
-                    let cached = !scopedResult.isAuthoritative ? sessionCatalogCache.sessions(forKey: cacheKey).filter {
+                    let cached = sessionCatalogCache.cachedSessionsForLiveMerge(
+                        remoteSessions: scoped,
+                        isAuthoritative: scopedResult.isAuthoritative,
+                        forKey: cacheKey
+                    ).filter {
                         sessionBelongsToProfile($0, profile: profile)
-                    } : []
+                    }
                     let merged = uniqueSessions(scoped + cached)
 
                     // Fetch cron sessions separately -- the main query excludes them.
+                    let cachedCronSessions = sessionCatalogCache.cachedSessions(forKey: cronKey)?.filter {
+                        sessionBelongsToProfile($0, profile: profile)
+                    }
+                    let publishedCronSnapshot = self.cronSessions.filter {
+                        sessionBelongsToProfile($0, profile: profile)
+                    }
                     let cronSessions: [SessionSummary]?
-                    if !forceRefresh, let cached = sessionCatalogCache.cachedSessions(forKey: cronKey) {
-                        cronSessions = cached.filter { sessionBelongsToProfile($0, profile: profile) }
+                    if !forceRefresh, let cachedCronSessions {
+                        cronSessions = cachedCronSessions
                     } else {
                         do {
                             cronSessions = try await dashboardCronSessions(
@@ -4875,25 +4901,29 @@ final class AppState: ObservableObject {
                           self.client === client else {
                         throw DashboardTicketBridgeError.notReady
                     }
-                    guard sessionCatalogCache.mutationGeneration == generation else {
-                        catalogRetryCount += 1
-                        guard catalogRetryCount < maximumCatalogRetries else {
-                            break
-                        }
-                        continue
-                    }
 
-                    let combined = uniqueSessions(merged + (cronSessions ?? sessionCatalogCache.sessions(forKey: cronKey)))
+                    let combined = uniqueSessions(
+                        merged + (cronSessions ?? cachedCronSessions ?? publishedCronSnapshot)
+                    )
                     if !combined.isEmpty || shouldLoadHistory == false {
-                        _ = sessionCatalogCache.commit(
+                        guard sessionCatalogCache.commit(
                             liveSessions: combined,
                             liveKey: cacheKey,
                             cronSessions: cronSessions,
                             cronKey: cronKey,
                             loadedFullHistoryKey: cacheKey,
-                            recordFullHistoryAt: scopedResult.isAuthoritative ? Date() : nil,
+                            recordFullHistoryAt: scopedResult.isAuthoritative && !scoped.isEmpty ? Date() : nil,
                             at: generation
-                        )
+                        ) else {
+                            catalogRetryCount += 1
+                            guard catalogRetryCount < maximumCatalogRetries else {
+                                sessionCatalogLog.warning(
+                                    "Dashboard catalog mutation retry budget exhausted for \(profile, privacy: .public); using gateway fallback."
+                                )
+                                break
+                            }
+                            continue
+                        }
                         sessionCatalogLog.notice("Dashboard catalog for \(profile, privacy: .public): \(combined.count, privacy: .public) sessions; \(self.sourceSummary(combined), privacy: .public)")
                         return combined
                     }
@@ -5016,7 +5046,7 @@ final class AppState: ObservableObject {
                 || (total.map { offset + batch.count < $0 } ?? false)
                 || batch.count == 200
             if !hasMore || batch.isEmpty {
-                isAuthoritative = true
+                isAuthoritative = !sessions.isEmpty
                 break
             }
         }

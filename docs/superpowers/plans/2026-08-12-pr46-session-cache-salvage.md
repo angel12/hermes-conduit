@@ -4,7 +4,7 @@
 
 **Goal:** Update PR #46 onto current `main` while retaining only its session-catalog cache invalidation behavior.
 
-**Architecture:** Use a non-rewriting merge of current `origin/main` into the contributor-owned PR branch. Current `main` remains authoritative for the already-merged stream, WebSocket, WebKit, rendering-cache, and image-fallback code; PR #46 contributes its AppState cache invalidation, bounded generation-checked retry, authoritative-catalog replacement, and cache expiry logic. The cache remains private to `AppState`; the standalone cache value type provides focused coverage for stale writes, alias-aware purges, failed cron loads, authoritative omissions, and expiry without adding a test-only production hook.
+**Architecture:** Use a non-rewriting merge of current `origin/main` into the contributor-owned PR branch. Current `main` remains authoritative for the already-merged stream, WebSocket, WebKit, rendering-cache, and image-fallback code; PR #46 contributes its AppState cache invalidation, bounded generation-checked retry, authoritative-catalog replacement, and cache expiry logic. Empty or unusable dashboard responses are non-authoritative and preserve a prior live snapshot. The cache remains private to `AppState`; the standalone cache value type provides focused coverage for stale writes, alias-aware purges, failed cron loads, empty responses, authoritative omissions, and expiry without adding a test-only production hook.
 
 **Tech Stack:** Swift 5.9, SwiftUI, XCTest, XcodeGen, Xcode 26.5, iOS Simulator.
 
@@ -15,7 +15,7 @@
 - Keep the session cache purge attached to successful delete/archive paths and explicit disconnect.
 - Abort catalog publication when the profile, client, or dashboard bridge changes while a request is suspended.
 - Preserve the previous cron cache when its refresh fails, and bound mutation retries.
-- Replace cached live rows after a complete dashboard catalog response; retain older rows only for explicitly partial responses, which are refreshed after a bounded cache lifetime.
+- Replace cached live rows after a meaningful complete dashboard catalog response; treat empty or unusable responses as non-authoritative so they cannot wipe a prior snapshot or refresh its full-history marker. Retain older rows for explicitly partial responses, which are refreshed after a bounded cache lifetime.
 - Do not add a production-only test hook solely to expose private AppState caches.
 - Run the generated-project full test suite before publishing the branch.
 
@@ -110,7 +110,8 @@ needed.
 **Interfaces:**
 - Consumes: The reduced effective diff from Task 1.
 - Produces: Focused coverage for stale commit rejection, alias-aware purges,
-  cache reset, failed cron refreshes, authoritative remote omissions, and
+  cache reset, failed cron refreshes, empty-response preservation,
+  authoritative remote omissions, and
   bounded full-history expiry. The WebKit-backed delete/archive integration
   boundary remains outside the unit-test harness.
 

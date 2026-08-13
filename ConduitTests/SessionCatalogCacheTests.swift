@@ -115,6 +115,32 @@ final class SessionCatalogCacheTests: XCTestCase {
         XCTAssertEqual(cache.sessions(forKey: "default:exclude"), [retained])
     }
 
+    func testEmptyRemoteCatalogPreservesCachedRowsForLiveMerge() {
+        var cache = SessionCatalogCache()
+        let cached = session(id: "cached-id", title: "Cached")
+
+        XCTAssertTrue(
+            cache.commit(
+                liveSessions: [cached],
+                liveKey: "default:exclude",
+                cronSessions: [],
+                cronKey: "default:cron",
+                loadedFullHistoryKey: "default:exclude",
+                recordFullHistoryAt: Date(timeIntervalSince1970: 100),
+                at: cache.mutationGeneration
+            )
+        )
+
+        XCTAssertEqual(
+            cache.cachedSessionsForLiveMerge(
+                remoteSessions: [],
+                isAuthoritative: true,
+                forKey: "default:exclude"
+            ),
+            [cached]
+        )
+    }
+
     func testFailedCronFetchDoesNotPoisonTheCronCache() {
         var cache = SessionCatalogCache()
         let live = session(id: "live-id", title: "Live")
