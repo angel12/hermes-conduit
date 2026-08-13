@@ -118,6 +118,103 @@ struct ChatResumeLifecycleOperations {
     static let live = ChatResumeLifecycleOperations()
 }
 
+/// Owns the profile-scoped session catalog cache and rejects writes from a
+/// load that started before a destructive cache mutation. AppState is
+/// main-actor isolated, but every dashboard request can re-enter the actor
+/// while it awaits WebKit, so a request must not overwrite a newer purge when
+/// it resumes.
+struct SessionCatalogCache {
+    static let fullHistoryRefreshInterval: TimeInterval = 5 * 60
+
+    private(set) var sessionsByKey: [String: [SessionSummary]] = [:]
+    private(set) var loadedFullHistoryKeys = Set<String>()
+    private(set) var fullHistoryLoadedAt: [String: Date] = [:]
+    private(set) var mutationGeneration: UInt64 = 0
+
+    func sessions(forKey key: String) -> [SessionSummary] {
+        sessionsByKey[key] ?? []
+    }
+
+    func cachedSessions(forKey key: String) -> [SessionSummary]? {
+        sessionsByKey[key]
+    }
+
+    /// Returns cached rows to merge unless the dashboard supplied a meaningful
+    /// authoritative replacement. An empty response is not safe evidence that
+    /// a populated catalog was deleted: it can also represent a transient,
+    /// malformed, or profile-mismatched response.
+    func cachedSessionsToMerge(
+        remoteSessions: [SessionSummary],
+        isAuthoritative: Bool,
+        forKey key: String
+    ) -> [SessionSummary] {
+        if isAuthoritative && !remoteSessions.isEmpty {
+            return []
+        }
+        return sessions(forKey: key)
+    }
+
+    func shouldLoadFullHistory(
+        forKey key: String,
+        forceRefresh: Bool,
+        now: Date = Date()
+    ) -> Bool {
+        guard !forceRefresh,
+              loadedFullHistoryKeys.contains(key),
+              let loadedAt = fullHistoryLoadedAt[key] else {
+            return true
+        }
+        return now.timeIntervalSince(loadedAt) >= Self.fullHistoryRefreshInterval
+    }
+
+    /// Commits a live and cron snapshot only when no cache mutation occurred
+    /// during the load that produced it.
+    @discardableResult
+    mutating func commit(
+        liveSessions: [SessionSummary],
+        liveKey: String,
+        cronSessions: [SessionSummary]?,
+        cronKey: String,
+        historyMarkers: [String: Date],
+        at generation: UInt64
+    ) -> Bool {
+        guard generation == mutationGeneration else { return false }
+        sessionsByKey[liveKey] = liveSessions
+        if let cronSessions {
+            sessionsByKey[cronKey] = cronSessions
+        }
+        for (key, loadedAt) in historyMarkers {
+            loadedFullHistoryKeys.insert(key)
+            fullHistoryLoadedAt[key] = loadedAt
+        }
+        return true
+    }
+
+    mutating func removeAll() {
+        mutationGeneration &+= 1
+        sessionsByKey.removeAll()
+        loadedFullHistoryKeys.removeAll()
+        fullHistoryLoadedAt.removeAll()
+    }
+
+    mutating func removeValue(forKey key: String) {
+        mutationGeneration &+= 1
+        sessionsByKey.removeValue(forKey: key)
+        loadedFullHistoryKeys.remove(key)
+        fullHistoryLoadedAt.removeValue(forKey: key)
+    }
+
+    mutating func removeSession(withIDs sessionIDs: Set<String>) {
+        mutationGeneration &+= 1
+        for key in sessionsByKey.keys {
+            sessionsByKey[key]?.removeAll { cachedSession in
+                let cachedIDs = Set([cachedSession.id] + cachedSession.alternateIds)
+                return !cachedIDs.isDisjoint(with: sessionIDs)
+            }
+        }
+    }
+}
+
 @MainActor
 private func scheduleChatResumeReconnectTask(
     after delay: TimeInterval,
@@ -532,15 +629,22 @@ final class AppState: ObservableObject {
     private let sessionCatalogLoaderOverride: ((Bool) async throws -> [SessionSummary])?
     private var reconnectAttempts = 0
     private var connectedAt: Date?
-    private var profileSessionCache: [String: [SessionSummary]] = [:]
+    private var sessionCatalogCache = SessionCatalogCache()
     private var projectsRequestGeneration = 0
-    private var loadedFullSessionHistory = Set<String>()
     private let sessionPresentationCache: SessionPresentationCache
 
     /// The dashboard's persisted transcript is richer than `session.resume`:
     /// it retains database timestamps, complete tool-call inputs, and other
     /// presentation fields. The resume RPC remains authoritative for live turn
     /// state and any in-flight projection.
+    private struct DashboardSessionCatalog {
+        let sessions: [SessionSummary]
+        /// True only when the dashboard returned a meaningful, terminal
+        /// catalog. Empty or unusable responses must remain mergeable with
+        /// the previous snapshot instead of evicting it.
+        let isAuthoritative: Bool
+    }
+
     private struct PersistedSessionTranscript {
         let resolvedSessionId: String?
         let messages: [ChatMessage]
@@ -1237,8 +1341,7 @@ final class AppState: ObservableObject {
         recoverySequence.cancel()
         chatResumeRestorationRequest = nil
         invalidateReconciliation()
-        profileSessionCache.removeAll()
-        loadedFullSessionHistory.removeAll()
+        sessionCatalogCache.removeAll()
         sessions = []
         cronSessions = []
         archivedSessions = []
@@ -1672,6 +1775,12 @@ final class AppState: ObservableObject {
         showLogin = true
         sessions = []
         archivedSessions = []
+        cronSessions = []
+        // Sessions can be deleted from another client while signed out; a
+        // stale catalog cache would show those rows again after re-sign-in
+        // (and the full-history marker would suppress the reload that could
+        // correct them).
+        sessionCatalogCache.removeAll()
         pinnedSessionIDs = []
         messages = []
         setActiveSessionState(id: nil, title: "New conversation")
@@ -3497,9 +3606,8 @@ final class AppState: ObservableObject {
 
         let sessionKey = "\(activeProfile):exclude"
         let cronKey = "\(activeProfile):cron"
-        profileSessionCache.removeValue(forKey: sessionKey)
-        profileSessionCache.removeValue(forKey: cronKey)
-        loadedFullSessionHistory.remove(sessionKey)
+        sessionCatalogCache.removeValue(forKey: sessionKey)
+        sessionCatalogCache.removeValue(forKey: cronKey)
         await loadSessions(forceRefresh: true)
     }
 
@@ -3705,6 +3813,13 @@ final class AppState: ObservableObject {
     private func removeSessionFromLiveCatalog(_ session: SessionSummary) {
         sessions.removeAll { sessionMatches($0, session) }
         cronSessions.removeAll { sessionMatches($0, session) }
+        // Every non-forced catalog load merges the profile cache back into
+        // the published arrays and re-saves the union. A row left in the
+        // cache therefore resurrects a deleted or archived conversation on
+        // the next foreground or send, until a pull-to-refresh purges it.
+        sessionCatalogCache.removeSession(
+            withIDs: Set([session.id] + session.alternateIds)
+        )
     }
 
     func clearActiveSessionIfNeeded(
@@ -4727,36 +4842,112 @@ final class AppState: ObservableObject {
         if let dashboardTicketBridge {
             do {
                 let cacheKey = "\(profile):exclude"
-                let shouldLoadHistory = forceRefresh || !loadedFullSessionHistory.contains(cacheKey)
-                let scoped = try await dashboardSessions(
-                    profile: profile,
-                    loadFullHistory: shouldLoadHistory,
-                    using: dashboardTicketBridge
-                ).filter { sessionBelongsToProfile($0, profile: profile) }
-
-                let cached = forceRefresh ? [] : (profileSessionCache[cacheKey] ?? []).filter {
-                    sessionBelongsToProfile($0, profile: profile)
-                }
-                let merged = uniqueSessions(scoped + cached)
-                // Fetch cron sessions separately -- the main query excludes them.
                 let cronKey = "\(profile):cron"
-                let cronSessions: [SessionSummary]
-                if !forceRefresh, let cached = profileSessionCache[cronKey] {
-                    cronSessions = cached.filter { sessionBelongsToProfile($0, profile: profile) }
-                } else {
-                    cronSessions = ((try? await dashboardCronSessions(profile: profile, using: dashboardTicketBridge)) ?? []).filter {
+                let maximumCatalogRetries = 3
+                var catalogRetryCount = 0
+                while true {
+                    let generation = sessionCatalogCache.mutationGeneration
+                    let shouldLoadHistory = sessionCatalogCache.shouldLoadFullHistory(
+                        forKey: cacheKey,
+                        forceRefresh: forceRefresh
+                    )
+                    let scopedResult = try await dashboardSessions(
+                        profile: profile,
+                        loadFullHistory: shouldLoadHistory,
+                        using: dashboardTicketBridge
+                    )
+                    let scoped = scopedResult.sessions.filter {
                         sessionBelongsToProfile($0, profile: profile)
                     }
-                    profileSessionCache[cronKey] = cronSessions
-                }
-                let combined = uniqueSessions(merged + cronSessions)
-                if !combined.isEmpty || shouldLoadHistory == false {
-                    loadedFullSessionHistory.insert(cacheKey)
-                    sessionCatalogLog.notice("Dashboard catalog for \(profile, privacy: .public): \(combined.count, privacy: .public) sessions; \(self.sourceSummary(combined), privacy: .public)")
-                    profileSessionCache[cacheKey] = combined
-                    return combined
+
+                    let cached = sessionCatalogCache.cachedSessionsToMerge(
+                        remoteSessions: scoped,
+                        isAuthoritative: scopedResult.isAuthoritative,
+                        forKey: cacheKey
+                    ).filter {
+                        sessionBelongsToProfile($0, profile: profile)
+                    }
+                    let merged = uniqueSessions(scoped + cached)
+
+                    // Fetch cron sessions separately -- the main query excludes them.
+                    let shouldLoadCron = sessionCatalogCache.shouldLoadFullHistory(
+                        forKey: cronKey,
+                        forceRefresh: forceRefresh
+                    )
+                    let cachedCronSessions = sessionCatalogCache.cachedSessions(forKey: cronKey)?.filter {
+                        sessionBelongsToProfile($0, profile: profile)
+                    }
+                    let publishedCronSnapshot = self.cronSessions.filter {
+                        sessionBelongsToProfile($0, profile: profile)
+                    }
+                    var didFetchCronSessions = false
+                    let cronSessions: [SessionSummary]?
+                    if !shouldLoadCron, let cachedCronSessions {
+                        cronSessions = cachedCronSessions
+                    } else {
+                        do {
+                            cronSessions = try await dashboardCronSessions(
+                                profile: profile,
+                                using: dashboardTicketBridge
+                            ).filter {
+                                sessionBelongsToProfile($0, profile: profile)
+                            }
+                            didFetchCronSessions = true
+                        } catch {
+                            // Keep a previous cron snapshot if one exists, but
+                            // do not cache an empty result for a failed request.
+                            cronSessions = nil
+                        }
+                    }
+
+                    // A delete/archive/disconnect can run while either request
+                    // is suspended. Never let this attempt overwrite the
+                    // newer cache state; retry from the authoritative source.
+                    guard profile == activeProfile,
+                          self.dashboardTicketBridge === dashboardTicketBridge,
+                          self.client === client else {
+                        throw DashboardTicketBridgeError.notReady
+                    }
+
+                    let combined = uniqueSessions(
+                        merged + (cronSessions ?? cachedCronSessions ?? publishedCronSnapshot)
+                    )
+                    if !combined.isEmpty || shouldLoadHistory == false {
+                        var historyMarkers: [String: Date] = [:]
+                        if scopedResult.isAuthoritative && !scoped.isEmpty {
+                            historyMarkers[cacheKey] = Date()
+                        }
+                        if didFetchCronSessions {
+                            historyMarkers[cronKey] = Date()
+                        }
+                        guard sessionCatalogCache.commit(
+                            liveSessions: combined,
+                            liveKey: cacheKey,
+                            cronSessions: cronSessions,
+                            cronKey: cronKey,
+                            historyMarkers: historyMarkers,
+                            at: generation
+                        ) else {
+                            catalogRetryCount += 1
+                            guard catalogRetryCount < maximumCatalogRetries else {
+                                sessionCatalogLog.warning(
+                                    "Dashboard catalog mutation retry budget exhausted for \(profile, privacy: .public); using gateway fallback."
+                                )
+                                break
+                            }
+                            continue
+                        }
+                        sessionCatalogLog.notice("Dashboard catalog for \(profile, privacy: .public): \(combined.count, privacy: .public) sessions; \(self.sourceSummary(combined), privacy: .public)")
+                        return combined
+                    }
+                    break
                 }
             } catch {
+                guard profile == activeProfile,
+                      self.dashboardTicketBridge === dashboardTicketBridge,
+                      self.client === client else {
+                    throw DashboardTicketBridgeError.notReady
+                }
                 sessionCatalogLog.error("Dashboard history failed; using gateway fallback: \(error.localizedDescription, privacy: .public)")
                 // Keep older dashboard installations usable; the gateway is
                 // still an authoritative fallback when the history endpoint is
@@ -4850,26 +5041,47 @@ final class AppState: ObservableObject {
         profile: String,
         loadFullHistory: Bool,
         using bridge: DashboardTicketBridge
-    ) async throws -> [SessionSummary] {
+    ) async throws -> DashboardSessionCatalog {
         let maximumPages = loadFullHistory ? 25 : 1
         var sessions: [SessionSummary] = []
+        var isAuthoritative = false
 
         for page in 0..<maximumPages {
             let offset = page * 200
             let response = try await bridge.requestJSON(path: profileSessionsPath(profile, offset: offset))
             let batch = response["sessions"] as? [Any] ?? []
-            sessions += dashboardOwnedSessions(batch, profile: profile)
+            let normalizedBatch = dashboardOwnedSessions(batch, profile: profile)
+            sessions += normalizedBatch
 
+            let rawHasMore = response["has_more"] ?? response["hasMore"]
+            let explicitHasMore = rawHasMore.map { booleanValue($0) }
             let nextOffset = integerValue(response["next_offset"] ?? response["nextOffset"])
             let total = integerValue(response["total"])
-            let hasMore = booleanValue(response["has_more"] ?? response["hasMore"])
-                || (nextOffset ?? 0) > offset
-                || (total.map { offset + batch.count < $0 } ?? false)
-                || batch.count == 200
-            if !hasMore || batch.isEmpty { break }
+            let hasExplicitTerminalSignal = explicitHasMore == false
+                || (nextOffset.map { $0 <= offset } ?? false)
+                || (total.map { offset + batch.count >= $0 } ?? false)
+            let hasMore = !hasExplicitTerminalSignal && (
+                explicitHasMore == true
+                    || (nextOffset ?? 0) > offset
+                    || (total.map { offset + batch.count < $0 } ?? false)
+                    || batch.count == 200
+            )
+            if batch.isEmpty {
+                // An empty page after a non-empty prefix is not proof that
+                // the full catalog was read. Preserve older rows and retry a
+                // complete load later instead of evicting the cached suffix.
+                break
+            }
+            if !hasMore {
+                isAuthoritative = hasExplicitTerminalSignal && !normalizedBatch.isEmpty
+                break
+            }
         }
 
-        return sessions
+        return DashboardSessionCatalog(
+            sessions: sessions,
+            isAuthoritative: isAuthoritative
+        )
     }
 
     private func dashboardArchivedSessions(
