@@ -864,9 +864,165 @@ private struct RemoteMarkdownImage: View {
     }
 }
 
+/// Resolves a model-authored image destination without treating a non-nil URL
+/// as proof that it is a usable web destination. Strict parsing preserves
+/// existing percent escapes; component-aware repair handles spaces and other
+/// invalid characters without encoding URL delimiters or double-encoding `%XX`.
+enum WebFallbackImageDestination {
+    static func resolve(_ value: String) -> URL? {
+        if let strictURL = URL(string: value, encodingInvalidCharacters: false),
+           isValidWebDestination(strictURL) {
+            return strictURL
+        }
+
+        guard var components = URLComponents(string: value),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = components.host,
+              !host.isEmpty,
+              let rawComponents = rawComponents(from: value),
+              let encodedPath = encodedComponent(
+                  rawComponents.path,
+                  allowedCharacters: .urlPathAllowed
+              ) else {
+            return nil
+        }
+
+        components.scheme = scheme
+        components.percentEncodedPath = encodedPath
+        if let query = rawComponents.query {
+            guard let encodedQuery = encodedComponent(
+                query,
+                allowedCharacters: .urlQueryAllowed
+            ) else { return nil }
+            components.percentEncodedQuery = encodedQuery
+        } else {
+            components.percentEncodedQuery = nil
+        }
+        if let fragment = rawComponents.fragment {
+            guard let encodedFragment = encodedComponent(
+                fragment,
+                allowedCharacters: .urlFragmentAllowed
+            ) else { return nil }
+            components.percentEncodedFragment = encodedFragment
+        } else {
+            components.percentEncodedFragment = nil
+        }
+
+        return isValidWebDestination(components.url) ? components.url : nil
+    }
+
+    private struct RawComponents {
+        let path: String
+        let query: String?
+        let fragment: String?
+    }
+
+    /// URLComponents exposes a decoded `path` when a URL has another invalid
+    /// component. Reading that value would turn an existing `%2F` into `/`
+    /// while repairing, so split the original string before encoding each
+    /// component instead.
+    private static func rawComponents(from value: String) -> RawComponents? {
+        guard let schemeEnd = value.firstIndex(of: ":") else { return nil }
+        let authorityStart = value.index(after: schemeEnd)
+        guard value[authorityStart...].hasPrefix("//") else { return nil }
+
+        let suffixStart = value.index(authorityStart, offsetBy: 2)
+        guard let firstDelimiter = value[suffixStart...].firstIndex(where: { character in
+            character == "/" || character == "?" || character == "#"
+        }) else {
+            return RawComponents(path: "", query: nil, fragment: nil)
+        }
+
+        let suffix = value[firstDelimiter...]
+        let queryDelimiter = suffix.firstIndex(of: "?")
+        let fragmentDelimiter = suffix.firstIndex(of: "#")
+        let pathEnd = [queryDelimiter, fragmentDelimiter]
+            .compactMap { $0 }
+            .min() ?? suffix.endIndex
+        let path = String(suffix[..<pathEnd])
+
+        let query: String?
+        if let queryDelimiter,
+           fragmentDelimiter.map({ queryDelimiter < $0 }) ?? true {
+            let queryEnd = fragmentDelimiter ?? suffix.endIndex
+            query = String(suffix[suffix.index(after: queryDelimiter)..<queryEnd])
+        } else {
+            query = nil
+        }
+
+        let fragment = fragmentDelimiter.map { delimiter in
+            String(suffix[suffix.index(after: delimiter)...])
+        }
+
+        return RawComponents(path: path, query: query, fragment: fragment)
+    }
+
+    private static func isValidWebDestination(_ url: URL?) -> Bool {
+        guard let url,
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host,
+              !host.isEmpty else { return false }
+        return true
+    }
+
+    private static func encodedComponent(
+        _ value: String,
+        allowedCharacters: CharacterSet
+    ) -> String? {
+        var allowed = allowedCharacters
+        allowed.insert(charactersIn: "%")
+        return escapedStrayPercents(in: value)
+            .addingPercentEncoding(withAllowedCharacters: allowed)
+    }
+
+    private static func escapedStrayPercents(in value: String) -> String {
+        let bytes = Array(value.utf8)
+        var escaped: [UInt8] = []
+        escaped.reserveCapacity(bytes.count)
+        var index = 0
+
+        while index < bytes.count {
+            guard bytes[index] == 37 else {
+                escaped.append(bytes[index])
+                index += 1
+                continue
+            }
+
+            if index + 2 < bytes.count,
+               isHexDigit(bytes[index + 1]),
+               isHexDigit(bytes[index + 2]) {
+                escaped.append(contentsOf: bytes[index...(index + 2)])
+                index += 3
+            } else {
+                escaped.append(contentsOf: [37, 50, 53])
+                index += 1
+            }
+        }
+
+        return String(decoding: escaped, as: UTF8.self)
+    }
+
+    private static func isHexDigit(_ byte: UInt8) -> Bool {
+        (byte >= 48 && byte <= 57)
+            || (byte >= 65 && byte <= 70)
+            || (byte >= 97 && byte <= 102)
+    }
+}
+
 /// AsyncImage is fast for ordinary HTTPS hosts. Some image CDNs reject its
 /// URLSession user agent or redirect to HTTP; WebKit follows the same browser
 /// path as the source link, but is isolated to this image-only fallback.
+enum WebFallbackImageLabel {
+    static func title(alt: String, destinationAvailable: Bool) -> String {
+        if destinationAvailable {
+            return alt.isEmpty ? "Open image" : "\(alt) — image unavailable; open source"
+        }
+        return alt.isEmpty ? "Image unavailable" : "\(alt) unavailable"
+    }
+}
+
 private struct WebFallbackImage: View {
     let url: String
     let alt: String
@@ -876,18 +1032,39 @@ private struct WebFallbackImage: View {
     var body: some View {
         Group {
             if failed {
-                Link(destination: URL(string: url)!) {
-                    Label(alt.isEmpty ? "Open image" : "Image unavailable — open source", systemImage: "photo.badge.exclamationmark")
-                        .font(.footnote.weight(.semibold))
-                }
-                .tint(.conduitAccent)
-                .padding(12)
-                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                // A model-authored URL is not guaranteed to be RFC-valid
+                // (unencoded non-ASCII paths are common); force-unwrapping
+                // here crashed the app on exactly the images most likely to
+                // reach this fallback.
+                fallbackLabel
+                    .padding(12)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
             } else {
                 RemoteImageWebView(url: url, height: $height, failed: $failed)
                     .frame(height: min(max(height, 80), 420))
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
+        }
+    }
+
+    @ViewBuilder
+    private var fallbackLabel: some View {
+        if let destination = WebFallbackImageDestination.resolve(url) {
+            Link(destination: destination) {
+                Label(
+                    WebFallbackImageLabel.title(alt: alt, destinationAvailable: true),
+                    systemImage: "photo.badge.exclamationmark"
+                )
+                .font(.footnote.weight(.semibold))
+            }
+                .tint(.conduitAccent)
+        } else {
+            Label(
+                WebFallbackImageLabel.title(alt: alt, destinationAvailable: false),
+                systemImage: "photo.badge.exclamationmark"
+            )
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
         }
     }
 }
